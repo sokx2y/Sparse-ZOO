@@ -1,0 +1,10 @@
+*.png
+*.txt
+*.log
+*log*
+
+*__pycache__*
+
+medium_models/data/*
+medium_models/result/*
+medium_models/custom_linear_plots/*

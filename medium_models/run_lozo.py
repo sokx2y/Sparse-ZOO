@@ -10,8 +10,10 @@ import torch
 import torch.nn.functional as F
 
 import numpy as np
+import traceback
 
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, EvalPrediction, PreTrainedTokenizerBase
+from transformers.pipelines import model_info
 from src.modeling_roberta import RobertaConfig
 from src.modeling_opt import OPTConfig
 from transformers import GlueDataTrainingArguments as DataTrainingArguments
@@ -22,6 +24,7 @@ from src.dataset import FewShotDataset, OurInputFeatures
 from src.models import MODEL_TYPES, resize_token_type_embeddings, convert_opt_model
 from src.LOZOtrainer import LowRankTrainer
 from src.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
+from src.custom_linear import get_all_custom_layers, replace_linear_layers_with_custom
 
 from filelock import FileLock
 from datetime import datetime
@@ -75,11 +78,11 @@ class ModelArguments:
         default=False,
         metadata={'help': 'use LoRA for finetuning'}
     )
-    lora_alpha: int = field(
+    lora_alpha: Optional[int] = field(
         default=None,
         metadata={'help': 'initialization scale for one of the low rank matrices in lora'}
     )
-    lora_r: int = field(
+    lora_r: Optional[int] = field(
         default=None,
         metadata={'help': 'inner rank for lora matrices'}
     )
@@ -122,52 +125,52 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
     )
 
     # For prompting
-    sfc_prompt: str = field(
+    sfc_prompt: Optional[str] = field(
         default=None,
         metadata={"help": "SFC prompt"}
     )
 
-    template: str = field(
+    template: Optional[str] = field(
         default=None,
         metadata={"help": "Template"}
     )
 
-    mapping: str = field(
+    mapping: Optional[str] = field(
         default=None,
         metadata={"help": "Label word mapping"}
     )
 
-    template_path: str = field(
+    template_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to a txt file that stores all the templates, one per line. Do not set this when prompt_path is used"}
     )
 
-    mapping_path: str = field(
+    mapping_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to a txt file that stores all the label word mappings, one per line. Do not set this when prompt_path is used"}
     )
 
-    prompt_path: str = field(
+    prompt_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to a txt file that stores all the prompts (templates and mappings), one per line"}
     )
 
-    template_id: int = field(
+    template_id: Optional[int] = field(
         default=None,
         metadata={"help": "Template id if using template_path"}
     )
 
-    mapping_id: int = field(
+    mapping_id: Optional[int] = field(
         default=None,
         metadata={"help": "Mapping id if using template_path"}
     )
 
-    prompt_id: int = field(
+    prompt_id: Optional[int] = field(
         default=None,
         metadata={"help": "Prompt id if using prompt_path"}
     )
 
-    top_n_template: int = field(
+    top_n_template: Optional[int] = field(
         default=None,
         metadata={"help": "Use top-n template in the template path"}
     )
@@ -189,7 +192,7 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
         metadata={"help": "Only use top-x\% similar instances in demonstrations"}
     )
 
-    demo_filter_model: str = field(
+    demo_filter_model: Optional[str] = field(
         default=None,
         metadata={"help": "Model name for demonstration filter embeddings. Will load embeddings based on the model name."}
     )
@@ -198,6 +201,22 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
         default=False,
         metadata={"help": "Debug mode"}
     )
+    
+    # CustomLinear相关参数
+    enable_custom_linear: bool = field(
+        default=False,
+        metadata={"help": "是否启用CustomLinear层来记录奇偶数次推理数据"}
+    )
+    
+    custom_linear_plot_dir: str = field(
+        default=None,
+        metadata={"help": "CustomLinear数据分布图保存目录"}
+    )
+    
+    plot_interval: int = field(
+        default=100,
+        metadata={"help": "每隔多少次推理绘制一次图表"}
+    )
 
     # For max length
     double_demo: bool = field(
@@ -205,18 +224,18 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
         metadata={"help": "Use double length for using demonstrations"}
     )
 
-    first_sent_limit: int = field(
+    first_sent_limit: Optional[int] = field(
         default=None,
         metadata={"help": "Limit the length of the first sentence (i.e., sent_0)"}
     )
 
-    other_sent_limit: int = field(
+    other_sent_limit: Optional[int] = field(
         default=None,
         metadata={"help": "Limit the length of sentences other than the first sentence"}
     )
 
     use_full_length: bool = field(
-        default=None,
+        default=False,
         metadata={"help": "Use the full length (512)"}
     )
 
@@ -251,7 +270,7 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
         default=False,
         metadata={"help": "Whether to use prompt-based fine-tuning"}
     )
-    template_list: List[str] = field(
+    template_list: Optional[List[str]] = field(
         default=None,
         metadata={"help": "(DO NOT List of templates (only initialized after the program starts."},
 
@@ -312,7 +331,7 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "Save test file logit with name $TASK-$MODEL_ID-$ARRAY_ID.npy"}
     )
 
-    save_logit_dir: str = field(
+    save_logit_dir: Optional[str] = field(
         default=None,
         metadata={"help": "Where to save the prediction result"}
     )
@@ -375,7 +394,7 @@ class DynamicTrainingArguments(TrainingArguments):
         default="logistic",
         metadata={"help": "choose kernel solver from {lstsq, logistic, svr, svc, asym (only for asymmetric_signgd)}"}
     )
-    load_kernels: str = field(
+    load_kernels: Optional[str] = field(
         default=None,
         metadata={'help': 'when specified, loads the kernels from the folder given here'}
     )
@@ -453,7 +472,7 @@ class DynamicTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Use fp16 for efficient zero order"}
     )
-    zero_order_sample_scheduler: str = field(
+    zero_order_sample_scheduler: Optional[str] = field(
         default=None,
         metadata={"help": "Have a sample scheduler. None, 'linear', 'power', or 'constant."}
     )
@@ -475,7 +494,7 @@ class DynamicTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "For ZO: estimate the gradients on each layer individually, scales number of forward passes per grad step by a factor of L"}
     )
-    zo_variant: str = field(
+    zo_variant: Optional[str] = field(
         default=None,
         metadata={"help": "Choose the MeZO variant: grad_norm or param_norm (see documentation)"}
     )
@@ -968,7 +987,21 @@ def main():
         for name, param in model.named_parameters():
             if (name.startswith('roberta') and "lora" not in name) or (name.startswith('opt') and "lora" not in name):
                 param.requires_grad_(False)
-
+    
+    # 启用CustomLinear功能
+    custom_layers = []
+    if data_args.enable_custom_linear:
+        logger.info("启用CustomLinear层来记录奇偶数次推理数据")
+        
+        # 创建保存目录
+        os.makedirs(data_args.custom_linear_plot_dir, exist_ok=True)
+        
+        # 替换模型中的Linear层为CustomLinear层
+        replace_linear_layers_with_custom(model)
+        logger.info(f"Replace All Linear Layers with CustomLinear Layers")
+        
+        print(f"model:{model}")
+    
     # Build metric
     def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
         def compute_metrics_fn(p: EvalPrediction):
@@ -1055,7 +1088,7 @@ def main():
                 torch.save(model_args, os.path.join(training_args.output_dir, "model_args.bin"))
                 torch.save(data_args, os.path.join(training_args.output_dir, "data_args.bin"))
             
-            if training_args.evaluate_during_training:
+            # if training_args.evaluate_during_training:
                 # Reload the best checkpoint (for eval)
                 # model.load_state_dict(trainer.best_model_ckpt)
                 # if training_args.prefix_tuning:
@@ -1069,7 +1102,7 @@ def main():
                 # model = model.to(training_args.device)
                 
                 # Now we just reload this from memory instead of disk <-- much faster
-                trainer.model.load_state_dict(trainer.best_model_ckpt)
+                # trainer.model.load_state_dict(trainer.best_model_ckpt)
 
     # Evaluation
     final_result = {
@@ -1078,7 +1111,7 @@ def main():
     }
 
     eval_results = {}
-    if training_args.do_eval:
+    if training_args.do_eval and data_args.custom_linear_plot_dir is None:
         logger.info("*** Validate ***")
 
         eval_datasets = [eval_dataset]
@@ -1149,7 +1182,128 @@ def main():
     logger.info('****** Output Dir *******')
     logger.info(training_args.output_dir)
 
+    # 如果启用了CustomLinear，在训练/评估完成后绘制数据分布图
+    if data_args.enable_custom_linear:
+        logger.info("开始绘制CustomLinear层的数据分布图...")
+        plot_custom_linear_data(model, data_args)
+    
     return eval_results
+
+
+
+def plot_custom_linear_data(model, data_args):
+    from src.custom_linear import CustomLinear
+    """
+    绘制CustomLinear层的数据分布图并保存numpy文件
+    
+    Args:
+        model: 模型
+        data_args: 数据参数
+        training_args: 训练参数
+    """
+    
+    # 创建numpy数据保存目录
+    numpy_data_dir = os.path.join(data_args.custom_linear_plot_dir, "numpy_data")
+    os.makedirs(numpy_data_dir, exist_ok=True)
+    logger.info(f"numpy数据将保存到: {numpy_data_dir}")
+    
+    # 为每个CustomLinear层绘制图表和保存数据
+    # for i, layer in enumerate(custom_layers):
+    for name, child in model.named_modules():
+        if isinstance(child, CustomLinear):
+            print(f"name:{name}")
+            print(f"child:{child}")
+
+            name = name.split(".")[3:]
+            name = ".".join(name)
+            
+            logger.info(f"为 {name} 绘制图表并保存数据 (推理次数: {child.inference_count})")
+            
+            # 绘制数据分布图
+            dist_plot_path = os.path.join(
+                data_args.custom_linear_plot_dir, 
+                f"layer_{name}_data_dist.png"
+            )
+            child.plot_data_distribution(save_path=dist_plot_path, show_plot=False)
+            
+            
+            # 保存numpy数据文件
+            numpy_save_path = os.path.join(numpy_data_dir, f"layer_{name}_data.npz")
+            save_layer_data_to_numpy(child, numpy_save_path, name)
+            
+            # 保存数据摘要
+            summary = child.get_data_summary()
+            summary_path = os.path.join(
+                data_args.custom_linear_plot_dir, 
+                f"layer_{name}_summary.txt"
+            )
+            with open(summary_path, 'w') as f:
+                f.write(f"CustomLinear Layer {name} 数据摘要\n")
+                f.write(f"推理次数: {summary['inference_count']}\n")
+                f.write(f"奇数次记录数: {summary['odd_records']}\n")
+                f.write(f"偶数次记录数: {summary['even_records']}\n")
+                f.write("\n统计信息:\n")
+                for key, values in summary['stats'].items():
+                    if values:
+                        f.write(f"{key}: {len(values)} 个值\n")
+                        f.write(f"  最新值: {values[-1]:.6f}\n")
+                        if len(values) > 1:
+                            f.write(f"  平均值: {np.mean(values):.6f}\n")
+                            f.write(f"  标准差: {np.std(values):.6f}\n")
+    
+    logger.info(f"Saved data distribution plots to: {data_args.custom_linear_plot_dir}")
+    logger.info(f"Saved numpy data to: {numpy_data_dir}")
+    
+
+
+def save_layer_data_to_numpy(layer, save_path, layer_idx):
+    """
+    将CustomLinear层的数据保存为numpy文件
+    
+    Args:
+        layer: CustomLinear层
+        save_path: 保存路径
+        layer_idx: 层索引
+    """
+    # try:
+    # 准备要保存的数据
+    data_dict = {
+        'layer_index': layer_idx,
+        'inference_count': layer.inference_count,
+        'odd_records_count': len(layer.odd_inputs),
+        'even_records_count': len(layer.even_inputs),
+        'max_records': layer.max_records,
+        'record_interval': layer.record_interval
+    }
+    
+        # 保存奇数次输入输出数据
+    if layer.odd_inputs:
+        odd_inputs_np = [(x.detach().cpu().numpy() if hasattr(x, 'detach') else (x.cpu().numpy() if hasattr(x, 'cpu') else np.asarray(x))) for x in layer.odd_inputs]
+        odd_outputs_np = [(x.detach().cpu().numpy() if hasattr(x, 'detach') else (x.cpu().numpy() if hasattr(x, 'cpu') else np.asarray(x))) for x in layer.odd_outputs]
+        data_dict['odd_inputs'] = np.array(odd_inputs_np, dtype=object)
+        data_dict['odd_outputs'] = np.array(odd_outputs_np, dtype=object)
+        data_dict['odd_inputs_shape'] = np.array([x.shape for x in odd_inputs_np], dtype=object)
+        data_dict['odd_outputs_shape'] = np.array([x.shape for x in odd_outputs_np], dtype=object)
+
+        # 保存偶数次输入输出数据
+    if layer.even_inputs:
+        even_inputs_np = [(x.detach().cpu().numpy() if hasattr(x, 'detach') else (x.cpu().numpy() if hasattr(x, 'cpu') else np.asarray(x))) for x in layer.even_inputs]
+        even_outputs_np = [(x.detach().cpu().numpy() if hasattr(x, 'detach') else (x.cpu().numpy() if hasattr(x, 'cpu') else np.asarray(x))) for x in layer.even_outputs]
+        data_dict['even_inputs'] = np.array(even_inputs_np, dtype=object)
+        data_dict['even_outputs'] = np.array(even_outputs_np, dtype=object)
+        data_dict['even_inputs_shape'] = np.array([x.shape for x in even_inputs_np], dtype=object)
+        data_dict['even_outputs_shape'] = np.array([x.shape for x in even_outputs_np], dtype=object)
+    
+    # 保存统计信息
+    data_dict['stats'] = layer.stats
+    
+    # 保存为npz文件
+    np.savez_compressed(save_path, **data_dict)
+    logger.info(f"第 {layer_idx} 层数据已保存到: {save_path}")
+        
+    # except Exception as e:
+    #     logger.error(f"保存第 {layer_idx} 层数据时出错: {e}")
+
 
 if __name__ == "__main__":
     main()

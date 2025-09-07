@@ -66,3 +66,22 @@ python tools/gather_result.py --condition "{'tag': 'k16-roberta-large-ft', 'task
 
 Then the program will find all the trials that satisfy the condition in `./log`, and print the mean/std of the final results. Note that the task names are all lower-cased here.
 
+
+## LOZO with Sparsity
+
+### 保存finetuning中间结果数据
+
+```bash
+bash scripts/profile_lozo.sh
+
+# 新加入变量
+# ENABLE_CUSTOM_LINEAR: 是否把所有linear替换为CustomLinear
+# CUSTOM_LINEAR_PLOT_DIR="./custom_linear_plots: 输出profile结果目录，包括分布图png，统计数据txt和保存数据为npz     
+# PLOT_INTERVAL=50: CustomLinear的记录间隔
+# LOG_DIR_PREFIX=test # 通过这个设置log保存目录
+```
+
+### 分析方法：
+
+使用 `analyze_odd_even_similarity.ipynb`
+
