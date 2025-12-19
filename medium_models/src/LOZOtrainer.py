@@ -160,19 +160,23 @@ class LowRankTrainer(LinearHeadTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.named_parameters_to_optim = [(name, param) for name, param in self.model.named_parameters() if param.requires_grad]
+        self.inference_step = 0
+        self.u = {} 
+        self.z = {}
+        # self.u_seeds = {} 
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
         """
         Based on Transformers' default one, we add fixing layer option where the bottom n layers' parameters
         are fixed and only the top layers are further fine-tuned.
         """
-        if self.args.hf_inference_model:
+        if self.args.hf_inference_model:   # 要是推理模型不加载训练所需的优化器和调度器
             return
 
-        if self.optimizer is None:
+        if self.optimizer is None:   # 初始化优化器
             params = {}
             for n, p in self.model.named_parameters():
-                if self.args.fix_layers > 0:
+                if self.args.fix_layers > 0:  # fix_layers是冻结层，该层参数不加入params中
                     if 'encoder.layer' in n:
                         try:
                             layer_num = int(n[n.find('encoder.layer') + 14:].split('.')[0])
@@ -202,6 +206,7 @@ class LowRankTrainer(LinearHeadTrainer):
                     "weight_decay": 0.0,
                 },
             ]
+            # 选择Optimizer
             if self.args.optimizer == 'adam':
                 self.optimizer = AdamW(
                     optimizer_grouped_parameters,
@@ -216,7 +221,7 @@ class LowRankTrainer(LinearHeadTrainer):
                 )
             else:
                 raise NotImplementedError
-        if self.lr_scheduler is None:
+        if self.lr_scheduler is None:   # 创建LR调度器
             self.lr_scheduler = get_scheduler(
                 self.args.lr_scheduler_type,
                 optimizer=self.optimizer,
@@ -224,7 +229,7 @@ class LowRankTrainer(LinearHeadTrainer):
                 num_training_steps=num_training_steps,
             )
 
-    def zo_forward(self, model, inputs):
+    def zo_forward(self, model, inputs, with_delta = False):   # 用于用ZO方法计算loss
         """
         Get (no gradient) loss from the model. Dropout is turned off too.
         """
@@ -232,12 +237,37 @@ class LowRankTrainer(LinearHeadTrainer):
 
         with torch.inference_mode():
             inputs = self._prepare_inputs(inputs)
+            self.inference_step = self.inference_step + 1
+            # print(f"inference:{self.inference_step} shape: {inputs['input_ids'].shape}")
             with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
+                if with_delta:
+                    if not hasattr(model, "forward_delta"):
+                        raise AttributeError(
+                            "model 没有 forward_delta 方法，请为 model 添加此路径"
+                        )
+                    outputs = model.forward_delta(**inputs)
+
+                    if not isinstance(outputs, (tuple, list)) or len(outputs) < 2:
+                        raise ValueError(
+                            "期望 model.forward_delta 返回 (loss_base, loss_perturbed, ...)，"
+                            f"但实际得到类型/长度为: {type(outputs)}, len={len(outputs) if isinstance(outputs, (tuple, list)) else 'N/A'}"
+                        )
+                    loss_base, loss_perturbed = outputs[0], outputs[1]
+                else:
+                    loss = self.compute_loss(model, inputs)
+                    
             if self.args.n_gpu > 1:
                 # Warning: this is copied from the original Huggingface Trainer. Untested.
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
-        return loss.detach()
+                if with_delta:
+                    loss_base = loss_base.mean()
+                    loss_perturbed = loss_perturbed.mean()
+                else:
+                    loss = loss.mean()
+                
+        if with_delta:
+            return loss_base.detach(), loss_perturbed.detach()
+        else:
+            return loss.detach()
 
 
     def zo_forward_nondiff(self, model, inputs):
@@ -289,13 +319,76 @@ class LowRankTrainer(LinearHeadTrainer):
                     self.v[name] = v
                 else:
                     v = self.v[name]
+                    
+                # new1: but failed: cached seed_u for regenration
+                # base_seed = random_seed if random_seed is not None else self.zo_random_seed
+                # u_seed = base_seed + hash(name) + step  
+                # self.u_seeds[name] = u_seed
+                # u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank, 
+                                          # device=param.data.device, dtype=param.data.dtype,
+                                          # random_seed=u_seed)
+
                 u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank, device=param.data.device, dtype=param.data.dtype)
-                param.data = param.data + scaling_factor * (u@v.t()) * self.args.zo_eps
+                # new2: cached u (low-rank matrix memory cost)
+                self.u[name] = u
+                # print(f"step:{step}: name:{name}, real_u[0]:{u[0]}, real_v[0]:{v[0]}")
+                param.data = param.data + scaling_factor * (u@v.t()) * self.args.zo_eps   # u*vT计算扰动矩阵
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                self.z[name] = z
+                # print(f"step:{step}: name:{name}, real_v:{z[0]}")
                 param.data = param.data + scaling_factor * z * self.args.zo_eps
+    
+    def make_z_provider(self):
+        """
+        provide z to replace diff_bias and diff_weight in layernorm
+        """
+        def provider(param_name, shape, device, dtype, inference_count):
+            z = None
+            if hasattr(self, "z"):
+                z = self.z.get(param_name, None)
+            if z is None:
+                z = torch.normal(mean=0.0, std=1.0, size=shape, device=device, dtype=dtype)
+            scale = -2 * self.args.zo_eps
+            return z, scale
+        
+        return provider
+    
+    def make_uv_provider(self):
+        """
+        provide u,v^t to replace diff_weight in our quantize method(QdiffLinear).
+        """
+        def provider(param_name, shape, device, dtype, inference_count):
+            out_f, in_f = shape
+            # provide v from cache
+            v = None
+            if hasattr(self, "v"):
+                v = self.v.get(param_name, None)
+            if v is None: 
+                v = torch.randn(in_f, self.args.rank, device=device, dtype=dtype)
+                
+            # But failed: provide u from regeneration(cache seed_u)
+            # if param_name in self.u_seeds:
+                # u_seed = self.u_seeds[param_name]
+                # u = self.random_gaussian_matrix(m=out_f, n=self.args.rank, device=device, dtype=dtype, random_seed=u_seed)
+            # else:
+                # print(f"Error: no u_seeds cache to regeneration!")
+            
+            # use cache_u directly
+            u = None
+            if hasattr(self, "u"):
+                u = self.u.get(param_name, None)
+            if u is None: 
+                u = torch.randn(out_f, self.args.rank, device=device, dtype=dtype)
+            
+            # The difference between the even iteration and the odd cached weights is −2×zo_eps×(UVT).
+            scale = -2 * self.args.zo_eps
+            return u, v, scale
 
-    def lowrank_zo_step(self, model, inputs):
+        return provider
+            
+
+    def lowrank_zo_step(self, model, inputs):   # 通过loss来用ZO方法估计梯度
         """
         Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
         """
@@ -318,23 +411,30 @@ class LowRankTrainer(LinearHeadTrainer):
         self.zo_random_seed = np.random.randint(1000000000)
 
         # First function evaluation
+        # and only one inference is enough, one inference, two loss
         self.lowrank_zo_perturb_parameters(scaling_factor=1)
-        loss1 = self.zo_forward(model, inputs)
+        # loss1 = self.zo_forward(model, inputs)
+        loss1, loss2 = self.zo_forward(model, inputs, with_delta = True)
+        
+        # print(f"step:{self.step}")
+        # print(f"inputs:{inputs}")
+        # print(f"loss1:{loss1}; loss2:{loss2}")
 
         # Second function evaluation
-        self.lowrank_zo_perturb_parameters(scaling_factor=-2)
-        loss2 = self.zo_forward(model, inputs)
+        # self.lowrank_zo_perturb_parameters(scaling_factor=-2)
+        # loss2 = self.zo_forward(model, inputs)
 
-        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()   # ZO估计梯度
 
         # No gradient accumulation support
         assert self.args.gradient_accumulation_steps == 1
 
         # Reset model back to its parameters at start of step
-        self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        # self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        self.lowrank_zo_perturb_parameters(scaling_factor=-1)
         return loss1
 
-    def lowrank_zo_update(self):
+    def lowrank_zo_update(self):  # SGD更新
         args = self.args
 
         # Reset the random seed for sampling zs
@@ -358,7 +458,12 @@ class LowRankTrainer(LinearHeadTrainer):
                 else:
                     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
 
-        self.lr_scheduler.step()
+        # self.lr_scheduler.step()
+        if getattr(self, "optimizer", None) is not None:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+        if getattr(self, "lr_scheduler", None) is not None:
+            self.lr_scheduler.step()
         
     def lowrank_zo_update_momentum(self):
         args = self.args
@@ -402,7 +507,12 @@ class LowRankTrainer(LinearHeadTrainer):
                 else:
                     param.data = param.data - self._get_learning_rate() * (self.exp_avg_m[name])
 
-        self.lr_scheduler.step()
+        # self.lr_scheduler.step()
+        if getattr(self, "optimizer", None) is not None:
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+        if getattr(self, "lr_scheduler", None) is not None:
+            self.lr_scheduler.step()
         
     # =====================================================================================================================================
         
@@ -483,6 +593,9 @@ class LowRankTrainer(LinearHeadTrainer):
                 output_device=self.args.local_rank,
                 find_unused_parameters=True,
             )
+        
+        batch = next(iter(train_dataloader))
+        # self.debug_check_forward_delta_alignment_one_batch(model, batch)
 
         # Train
         if transformers.is_torch_tpu_available():
@@ -565,7 +678,8 @@ class LowRankTrainer(LinearHeadTrainer):
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
-                    
+                
+                # -------------- this is the key in lozotrainer !!!! ---------------
                 if self.args.lowrank_zo:
                     tr_loss_step = self.lowrank_zo_step(model, inputs)
                     # tr_loss += tr_loss_step
@@ -588,9 +702,12 @@ class LowRankTrainer(LinearHeadTrainer):
                         logs["time"] = int(time.time() - start_time)
                         self.log(logs)
                         logger.info(str(logs))
+                # ---------------------------------------------------------------
                 # standard, non-ZO optimization
                 else:
                     tr_loss += self.training_step(model, inputs)
+
+                    scheduler.step()
 
                     if (step + 1) % self.args.gradient_accumulation_steps == 0 or (
                         # last step in epoch but step is always smaller than gradient_accumulation_steps
@@ -618,7 +735,7 @@ class LowRankTrainer(LinearHeadTrainer):
                         else:
                             optimizer.step()
 
-                        scheduler.step()
+                        # scheduler.step()
                         model.zero_grad()
                         self.state.global_step += 1
                         self.epoch = epoch + (step + 1) / len(epoch_iterator)
@@ -709,3 +826,136 @@ class LowRankTrainer(LinearHeadTrainer):
 
         return output
     
+    
+    
+
+
+
+    # def _apply_cached_perturb(self, scaling_factor: float):
+    #     """
+    #     Apply perturbation using cached self.u/self.v/self.z WITHOUT resampling.
+    #     This matches lowrank_zo_perturb_parameters but guarantees the same directions.
+    #     """
+    #     eps = self.args.zo_eps
+    # 
+    #     if not hasattr(self, "named_parameters_to_optim"):
+    #         raise RuntimeError("named_parameters_to_optim not set. Call debug func after building it.")
+    # 
+    #     for name, param in self.named_parameters_to_optim:
+    #         if param.data.ndim >= 2:
+    #             if not hasattr(self, "u") or not hasattr(self, "v"):
+    #                 raise RuntimeError("Missing self.u/self.v caches.")
+    #             u = self.u.get(name, None)
+    #             v = self.v.get(name, None)
+    #             if u is None or v is None:
+    #                 raise KeyError(f"Cached u/v not found for {name}. Name mismatch in provider?")
+    #             # param += scaling_factor * (u @ v^T) * eps
+    #             param.data.addmm_(u, v.t(), beta=1.0, alpha=scaling_factor * eps)
+    #         else:
+    #             if not hasattr(self, "z"):
+    #                 raise RuntimeError("Missing self.z cache.")
+    #             z = self.z.get(name, None)
+    #             if z is None:
+    #                 raise KeyError(f"Cached z not found for {name}. Name mismatch in provider?")
+    #             # param += scaling_factor * z * eps
+    #             param.data.add_(z, alpha=scaling_factor * eps)
+    # 
+    # 
+    # def debug_check_forward_delta_alignment_one_batch(
+    #     self,
+    #     model,
+    #     inputs,
+    #     n_param_check: int = 8,
+    # ):
+    #     """
+    #     One-batch alignment check:
+    #       1) perturb +1 -> theta_plus
+    #       2) compare:
+    #            loss_plus_real (normal forward at theta_plus)
+    #            vs loss_base_virtual (forward_delta first loss)
+    #       3) go to theta_minus using cached directions (apply -2)
+    #          compare:
+    #            loss_minus_real (normal forward at theta_minus)
+    #            vs loss_minus_virtual (forward_delta second loss)
+    #       4) restore theta (apply +1 from theta_minus)
+    #          check sampled parameter max error
+    #     """
+    #     model.eval()
+    #     with torch.inference_mode():
+    #         inputs = self._prepare_inputs(inputs)
+    # 
+    #         # Hard guards (otherwise your zo_forward protocol breaks)
+    #         assert inputs.get("labels", None) is not None, "with_delta alignment check requires labels in inputs."
+    #         assert not getattr(model, "return_full_softmax", False), "Disable return_full_softmax for ZO/delta training."
+    # 
+    #         # Build parameter list (same as your lowrank_zo_step)
+    #         self.named_parameters_to_optim = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    # 
+    #         # Snapshot a few params to verify exact restore
+    #         snap = []
+    #         for n, p in self.named_parameters_to_optim:
+    #             if len(snap) >= n_param_check:
+    #                 break
+    #             snap.append((n, p.detach().clone()))
+    # 
+    #         # Make sure caches exist (do not wipe existing training caches)
+    #         if not hasattr(self, "u"): self.u = {}
+    #         if not hasattr(self, "v"): self.v = {}
+    #         if not hasattr(self, "z"): self.z = {}
+    # 
+    #         # 1) theta -> theta_plus (this also fills self.u/self.v/self.z used by providers)
+    #         self.lowrank_zo_perturb_parameters(scaling_factor=1)
+    # 
+    #         # Compute loss at theta_plus via normal forward
+    #         with self.compute_loss_context_manager():
+    #             loss_plus_real = self.compute_loss(model, inputs).detach()
+    # 
+    #         # Compute (loss_base_virtual, loss_minus_virtual) via forward_delta at theta_plus
+    #         with self.compute_loss_context_manager():
+    #             out = model.forward_delta(**inputs)
+    #         if not isinstance(out, (tuple, list)) or len(out) < 2:
+    #             raise RuntimeError(f"forward_delta must return (loss_base, loss_pert, ...), got {type(out)} len={len(out)}")
+    #         loss_base_virtual = out[0].detach()
+    #         loss_minus_virtual = out[1].detach()
+    # 
+    #         # 2) theta_plus -> theta_minus using the SAME cached directions (apply -2)
+    #         self._apply_cached_perturb(scaling_factor=-2)
+    # 
+    #         with self.compute_loss_context_manager():
+    #             loss_minus_real = self.compute_loss(model, inputs).detach()
+    # 
+    #         # 3) restore theta_minus -> theta (apply +1)
+    #         self._apply_cached_perturb(scaling_factor=+1)
+    # 
+    #         # Param restore check
+    #         name2p = dict(model.named_parameters())
+    #         max_param_err = 0.0
+    #         for n, ref in snap:
+    #             cur = name2p[n].detach()
+    #             err = (cur - ref).abs().max().item()
+    #             max_param_err = max(max_param_err, err)
+    # 
+    #         # Print report
+    #         def _fmt(x):
+    #             return float(x.item()) if torch.is_tensor(x) else float(x)
+    # 
+    #         print("====== LOZO forward_delta alignment check (one batch) ======")
+    #         print(f"loss_plus_real     (normal @ theta+): { _fmt(loss_plus_real) }")
+    #         print(f"loss_base_virtual  (delta  @ theta+): { _fmt(loss_base_virtual) }")
+    #         print(f"abs diff (plus): { abs(_fmt(loss_plus_real) - _fmt(loss_base_virtual)) }")
+    #         print("------------------------------------------------------------")
+    #         print(f"loss_minus_real    (normal @ theta-): { _fmt(loss_minus_real) }")
+    #         print(f"loss_minus_virtual (delta  @ theta-): { _fmt(loss_minus_virtual) }")
+    #         print(f"abs diff (minus): { abs(_fmt(loss_minus_real) - _fmt(loss_minus_virtual)) }")
+    #         print("------------------------------------------------------------")
+    #         print(f"max_param_restore_err (sampled {len(snap)} params): {max_param_err}")
+    #         print("============================================================")
+    # 
+    #         return {
+    #             "loss_plus_real": loss_plus_real,
+    #             "loss_base_virtual": loss_base_virtual,
+    #             "loss_minus_real": loss_minus_real,
+    #             "loss_minus_virtual": loss_minus_virtual,
+    #             "max_param_restore_err": max_param_err,
+    #         }
+    # 

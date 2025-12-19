@@ -9,11 +9,11 @@ import os
 
 class CustomLinear(nn.Linear):
     """
-    自定义Linear层，能够记录奇数次和偶数次推理的前向数据
+    自定义Linear层，能够记录奇数次和偶数次推理的前向数据，新增tictoc不同计算output方法用以验证1 inference
     """
     
     def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None, 
-            record_interval: int = 100):
+            record_interval: int = 30):
         super().__init__(in_features, out_features, bias, device, dtype)
         
         # 记录推理次数
@@ -52,8 +52,8 @@ class CustomLinear(nn.Linear):
         output = super().forward(input)
         
         # 如果启用记录，则记录数据
-        if self.enable_recording and (self.inference_count % self.record_interval == 0 or self.inference_count % self.record_interval == 1):
-            print(f'inference count:{self.inference_count}, running record')
+        if self.enable_recording and (self.inference_count % self.record_interval == 0 or self.inference_count % self.record_interval == 1 or self.inference_count % self.record_interval == 2):
+            print(f'inference count:{self.inference_count}, running record，this inference input shape: {input.shape}')
             self._record_data(input.detach(), output.detach())
             
         return output

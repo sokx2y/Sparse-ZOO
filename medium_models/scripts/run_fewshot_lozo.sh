@@ -86,7 +86,7 @@ ALL_ARGS_TOGETHER="
     --model_name_or_path $MODEL --few_shot_type $TYPE
     --task_name $TASK --template $TEMPLATE --mapping $MAPPING
     --data_dir data/k-shot-1k-test/$TASK/$K-$SEED
-    --overwrite_output_dir --output_dir result/$TASK-$MODELNAME-$TYPE-$TRAINER-$TAG-$GRID_TAG/$K-$SEED
+    --overwrite_output_dir --output_dir result/$TASK-$MODELNAME-$TYPE-$TRAINER-$TAG-$GRID_TAG/$K-$SEED-$ENABLE
     --num_k $K
     --tag $TAG
     --max_seq_length 128

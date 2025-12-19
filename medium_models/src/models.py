@@ -14,6 +14,8 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 from typing import Callable, Dict, Optional, Union, List, Tuple
 import random
 
+from .diff_fake_quant_mx import diffLinear, QdiffLinear, diffEmbedding, diffLayerNorm
+
 
 import logging
 logger = logging.getLogger(__name__)
@@ -148,6 +150,172 @@ def model_for_prompting_forward(
         output = (torch.exp(logits[..., 1].unsqueeze(-1)) * (model.ub - model.lb) + model.lb,)
     return ((loss,) + output) if loss is not None else output
 
+def model_for_prompting_forward_delta(
+    model,
+    input_ids=None,
+    attention_mask=None,
+    token_type_ids=None,
+    mask_pos=None,
+    labels=None,
+    sfc_input_ids=None,
+    sfc_attention_mask=None,
+    sfc_mask_pos=None,
+):
+    # 用 base 来算校准偏置 
+    if sfc_input_ids is not None:
+        with torch.no_grad():
+            logits_sfc = model_for_prompting_forward(model,input_ids=sfc_input_ids,attention_mask=sfc_attention_mask,mask_pos=sfc_mask_pos,)[0]
+        icl_sfc_bias = F.log_softmax(logits_sfc.detach().squeeze(0))
+    else:
+        icl_sfc_bias = None
+
+    if mask_pos is not None:
+        mask_pos = mask_pos.squeeze()
+
+    model_fn = model.get_model_fn()
+    config = model.config
+
+    if hasattr(model_fn, "forward_delta"):
+        encoder_outputs = model_fn.forward_delta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True,
+        )
+        sequence_output = encoder_outputs.last_hidden_state
+        diff_sequence_output = encoder_outputs.diff_last_hidden_state
+    else:
+        raise NotImplementedError("model_fn has no forward_delta ...")
+        
+
+    if mask_pos is not None:
+        idx = torch.arange(sequence_output.size(0), device=sequence_output.device)
+        sequence_mask_output = sequence_output[idx, mask_pos]
+        diff_sequence_mask_output = diff_sequence_output[idx, mask_pos]
+    else:
+        sequence_mask_output = sequence_output[:, 0]
+        diff_sequence_mask_output = diff_sequence_output[:, 0]
+
+    if model.label_word_list is not None:
+        head_fn = model.get_lm_head_fn()
+        
+        if hasattr(head_fn, "forward_delta"):
+            vocab_logits_base, vocab_logits_diff = head_fn.forward_delta(
+                sequence_mask_output, diff_sequence_mask_output
+            )
+            vocab_logits_pert = vocab_logits_base + vocab_logits_diff
+        else:
+            raise NotImplementedError("lm_head has no forward_delta ...")
+            
+
+        # Exit early and only return mask logits.
+        if model.return_full_softmax:
+            if labels is not None:
+                zero_loss = torch.zeros(1, out=vocab_logits_base.new())
+                return zero_loss, zero_loss, vocab_logits_base, vocab_logits_pert
+            return vocab_logits_base, vocab_logits_pert
+        
+        # Return logits for each label
+        logits_base_list = []
+        logits_pert_list = []
+
+        if model.model_args.use_task_word:
+            for _id in model.label_word_list:
+                logits_base_list.append(vocab_logits_base[:, _id].unsqueeze(-1))
+                logits_pert_list.append(vocab_logits_pert[:, _id].unsqueeze(-1))
+        else:
+            for label_id in range(len(model.label_word_list)):
+                wid = model.label_word_list[label_id]
+                logits_base_list.append(vocab_logits_base[:, wid].unsqueeze(-1))
+                logits_pert_list.append(vocab_logits_pert[:, wid].unsqueeze(-1))
+
+        logits_base = torch.cat(logits_base_list, -1)
+        logits_pert = torch.cat(logits_pert_list, -1)
+
+        # Regression task (num_labels == 1) 的 log-softmax
+        if model.config.num_labels == 1:
+            logsoftmax = nn.LogSoftmax(-1)
+            logits_base = logsoftmax(logits_base)
+            logits_pert = logsoftmax(logits_pert)
+    else:
+        if hasattr(model.classifier, "forward_delta"):
+            # print(f"hihihihihi!!! i am classifier delta!!")
+            logits_base, logits_diff = model.classifier.forward_delta(
+                sequence_mask_output, diff_sequence_mask_output
+            )
+            logits_pert = logits_base + logits_diff
+        else:
+            raise NotImplementedError("classifier has no forward_delta ...")
+            
+
+    # loss_base / loss_perturbed
+    loss_base = None
+    loss_perturbed = None
+    if labels is not None:
+        if model.config.num_labels == 1:
+            # Regression task
+            if model.label_word_list is not None:
+                # KLDivLoss on log-prob labels
+                labels_prob = torch.stack([1 - (labels.view(-1) - model.lb) / (model.ub - model.lb),(labels.view(-1) - model.lb) / (model.ub - model.lb),],-1,)
+                kldiv = nn.KLDivLoss(log_target=True)
+                loss_base = kldiv(logits_base.view(-1, 2), labels_prob)
+                loss_perturbed = kldiv(logits_pert.view(-1, 2), labels_prob)
+            else:
+                # MSE on normalized regression target
+                labels_norm = (labels.float().view(-1) - model.lb) / (model.ub - model.lb)
+                mse = nn.MSELoss()
+                loss_base = mse(logits_base.view(-1), labels_norm)
+                loss_perturbed = mse(logits_pert.view(-1), labels_norm)
+        else:
+            if model.model_args.l2_loss:
+                coords = torch.nn.functional.one_hot(
+                    labels.squeeze(), model.config.num_labels
+                ).float()
+                mse = nn.MSELoss()
+                loss_base = mse(
+                    logits_base.view(-1, logits_base.size(-1)), coords
+                )
+                loss_perturbed = mse(
+                    logits_pert.view(-1, logits_pert.size(-1)), coords
+                )
+            else:
+                ce = nn.CrossEntropyLoss()
+                loss_base = ce(
+                    logits_base.view(-1, logits_base.size(-1)), labels.view(-1)
+                )
+                loss_perturbed = ce(
+                    logits_pert.view(-1, logits_pert.size(-1)), labels.view(-1)
+                )
+
+    if hasattr(model, "lr_weight"):
+        logits_base = torch.matmul(F.softmax(logits_base, -1), model.lr_weight)
+        logits_pert = torch.matmul(F.softmax(logits_pert, -1), model.lr_weight)
+    if hasattr(model, "lr_bias"):
+        b = model.lr_bias.unsqueeze(0)
+        logits_base = logits_base + b
+        logits_pert = logits_pert + b
+
+    if model.model_args.sfc and hasattr(model, "sfc_bias"):
+        logits_base = F.log_softmax(logits_base, -1) - model.sfc_bias
+        logits_pert = F.log_softmax(logits_pert, -1) - model.sfc_bias
+    if icl_sfc_bias is not None:
+        logits_base = F.log_softmax(logits_base, -1) - icl_sfc_bias
+        logits_pert = F.log_softmax(logits_pert, -1) - icl_sfc_bias
+
+    if model.model_args.use_task_word and model.num_labels == 1:
+        logits_base = torch.exp(logits_base[..., 1].unsqueeze(-1)) * (model.ub - model.lb) + model.lb
+        logits_pert = torch.exp(logits_pert[..., 1].unsqueeze(-1)) * (model.ub - model.lb) + model.lb
+
+    output = (logits_base, logits_pert,)
+    
+    # print(f"logits_base:{logits_base}, loss_base{loss_base}")
+    # print(f"logits_base:{logits_pert}, loss_base{loss_perturbed}")
+
+    if labels is not None:
+        return (loss_base, loss_perturbed) + output
+    else:
+        return output
+
 def convert_opt_model(model: OPTModel, config, num_exclude_layers):
     model.model.decoder = EfficientOPTDecoder(config, num_exclude_layers)
     return model
@@ -191,7 +359,11 @@ class RobertaModelForPromptFinetuning(RobertaPreTrainedModel):
         self.model_type = config.model_type
         self.roberta = RobertaModel(config)
         self.lm_head = RobertaLMHead(config)
-        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
+        use_diff = getattr(config, "apply_forward_delta", False)
+        if use_diff:
+            self.classifier = diffLinear(layer_name = "classifier", in_features = config.hidden_size, out_features = self.num_labels, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider)
+        else:
+            self.classifier = nn.Linear(config.hidden_size, self.num_labels)
 
         self.init_weights()
 
@@ -216,7 +388,11 @@ class RobertaModelForPromptFinetuning(RobertaPreTrainedModel):
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, mask_pos=None, labels=None):
         return model_for_prompting_forward(self, input_ids, attention_mask, token_type_ids, mask_pos, labels)
-
+    
+    def forward_delta(self, input_ids=None, attention_mask=None, token_type_ids=None, mask_pos=None, labels=None):
+        return model_for_prompting_forward_delta(self, input_ids, attention_mask, token_type_ids, mask_pos, labels)
+    
+    
 class OPTModelForPromptFinetuning(OPTForCausalLM):
     def __init__(self, config):
         super().__init__(config)

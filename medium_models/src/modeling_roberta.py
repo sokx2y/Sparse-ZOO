@@ -24,6 +24,9 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN, gelu
+
+from dataclasses import dataclass
+from transformers.utils import ModelOutput
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,
@@ -34,6 +37,7 @@ from transformers.modeling_outputs import (
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
+
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
 from transformers.utils import (
@@ -43,6 +47,9 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
+
+from .diff_fake_quant_mx import diffLinear, QdiffLinear, diffEmbedding, diffLayerNorm
+
 # from transformers.models.roberta.configuration_roberta import RobertaConfig
 
 import loralib as lora
@@ -61,6 +68,75 @@ ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "roberta-large-openai-detector",
     # See all RoBERTa models at https://huggingface.co/models?filter=roberta
 ]
+
+#新增 dataclass 用在encoder的forward_delta当中
+@dataclass
+class BaseModelOutputWithDelta(ModelOutput):
+    last_hidden_state: torch.Tensor = None
+    diff_last_hidden_state: torch.Tensor = None
+
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    diff_hidden_states: Optional[Tuple[torch.Tensor]] = None
+
+    attentions: Optional[Tuple[torch.Tensor]] = None
+    diff_attentions: Optional[Tuple[torch.Tensor]] = None
+
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    diff_cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    
+@dataclass
+class BaseModelOutputWithPoolingAndDelta(ModelOutput):
+    last_hidden_state: torch.Tensor = None
+    diff_last_hidden_state: torch.Tensor = None
+
+    pooler_output: torch.Tensor = None
+    diff_pooler_output: torch.Tensor = None
+
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    diff_hidden_states: Optional[Tuple[torch.Tensor]] = None
+
+    attentions: Optional[Tuple[torch.Tensor]] = None
+    diff_attentions: Optional[Tuple[torch.Tensor]] = None
+
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    diff_cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    
+@dataclass
+class CausalLMOutputWithDelta(ModelOutput):
+    loss_base: Optional[torch.Tensor] = None
+    loss_perturbed: Optional[torch.Tensor] = None
+
+    logits: torch.Tensor = None                     # base logits
+    perturbed_logits: torch.Tensor = None           # perturbed logits
+
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    perturbed_hidden_states: Optional[Tuple[torch.Tensor]] = None
+
+    attentions: Optional[Tuple[torch.Tensor]] = None
+    perturbed_attentions: Optional[Tuple[torch.Tensor]] = None
+
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    perturbed_cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    
+@dataclass
+class MaskedLMOutputWithDelta(ModelOutput):
+    loss_base: Optional[torch.Tensor] = None
+    loss_perturbed: Optional[torch.Tensor] = None
+
+    logits: torch.Tensor = None                     # base logits
+    perturbed_logits: torch.Tensor = None           # perturbed logits
+
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    perturbed_hidden_states: Optional[Tuple[torch.Tensor]] = None
+
+    attentions: Optional[Tuple[torch.Tensor]] = None
+    perturbed_attentions: Optional[Tuple[torch.Tensor]] = None
 
 from transformers import BertConfig
 class RobertaConfig(BertConfig):
@@ -83,13 +159,32 @@ class RobertaConfig(BertConfig):
     """
     model_type = "roberta"
 
-    def __init__(self, pad_token_id=1, bos_token_id=0, eos_token_id=2, apply_lora=False, lora_r=None, lora_alpha=None, **kwargs):
+    def __init__(self, pad_token_id=1, bos_token_id=0, eos_token_id=2, apply_lora=False, lora_r=None, lora_alpha=None, 
+                 apply_forward_delta = False, 
+                 enable_x = True, enable_diffx = True, enable_w = True, enable_diffw = True,
+                 mx_w_elem_format=None, mx_a_elem_format=None, mx_diffw_elem_format=None, mx_diffa_elem_format=None,
+                 uv_provider=None, z_provider=None,
+                 **kwargs):
         """Constructs RobertaConfig."""
         super().__init__(pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
 
         self.apply_lora = apply_lora
         self.lora_r = lora_r 
         self.lora_alpha = lora_alpha
+        
+        # forward_delta
+        self.apply_forward_delta = apply_forward_delta
+        self.uv_provider = uv_provider
+        self.z_provider = z_provider
+        self.enable_x = enable_x
+        self.enable_diffx = enable_diffx
+        self.enable_w = enable_w
+        self.enable_diffw = enable_diffw
+        self.mx_w_elem_format = mx_w_elem_format
+        self.mx_a_elem_format = mx_a_elem_format
+        self.mx_diffw_elem_format = mx_diffw_elem_format
+        self.mx_diffa_elem_format = mx_diffa_elem_format
+        
 
 class RobertaEmbeddings(nn.Module):
     """
@@ -99,13 +194,29 @@ class RobertaEmbeddings(nn.Module):
     # Copied from transformers.models.bert.modeling_bert.BertEmbeddings.__init__
     def __init__(self, config):
         super().__init__()
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        if getattr(config, "apply_forward_delta", False):
+            self.word_embeddings = diffEmbedding(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, padding_idx=config.pad_token_id, layer_name='roberta.embeddings.word_embeddings', uv_provider=config.uv_provider)
+        else:
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        
+        self.padding_idx = config.pad_token_id
+        if getattr(config, "apply_forward_delta", False):
+            self.position_embeddings = diffEmbedding(num_embeddings=config.max_position_embeddings, embedding_dim=config.hidden_size, padding_idx=config.pad_token_id, layer_name='roberta.embeddings.position_embeddings', uv_provider=config.uv_provider)
+        else:
+            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size, padding_idx=config.pad_token_id)
+        
+        if getattr(config, "apply_forward_delta", False):
+            self.token_type_embeddings = diffEmbedding(num_embeddings=config.type_vocab_size, embedding_dim=config.hidden_size, layer_name='roberta.embeddings.token_type_embeddings', uv_provider=config.uv_provider)
+        else:
+            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if getattr(config, "apply_forward_delta", False):
+            self.LayerNorm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name="roberta.embeddings.LayerNorm", z_provider=config.z_provider)
+        else:
+            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -115,10 +226,10 @@ class RobertaEmbeddings(nn.Module):
         )
 
         # End copy
-        self.padding_idx = config.pad_token_id
-        self.position_embeddings = nn.Embedding(
-            config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
-        )
+        # self.padding_idx = config.pad_token_id
+        # self.position_embeddings = nn.Embedding(
+            # config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
+        # )
 
     def forward(
         self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
@@ -159,6 +270,61 @@ class RobertaEmbeddings(nn.Module):
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
+    
+    def forward_delta(
+        self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
+    ):
+        if position_ids is None:
+            if input_ids is not None:
+                # Create the position ids from the input token ids. Any padded tokens remain padded.
+                position_ids = create_position_ids_from_input_ids(input_ids, self.padding_idx, past_key_values_length)
+            else:
+                position_ids = self.create_position_ids_from_inputs_embeds(inputs_embeds)
+
+        if input_ids is not None:
+            input_shape = input_ids.size()
+        else:
+            input_shape = inputs_embeds.size()[:-1]
+
+        seq_length = input_shape[1]
+        
+        if token_type_ids is None:
+            if hasattr(self, "token_type_ids"):
+                buffered_token_type_ids = self.token_type_ids[:, :seq_length]
+                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
+                token_type_ids = buffered_token_type_ids_expanded
+            else:
+                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
+        
+        # word_embeddings: base + delta 
+        if inputs_embeds is None:
+            inputs_embeds, diff_inputs_embeds = self.word_embeddings.forward_delta(input_ids)
+        else:
+            raise NotImplementedError("forward_delta does not support inputs_embeds; pass input_ids instead.")
+            # diff_inputs_embeds = torch.zeros_like(inputs_embeds)
+
+        # token_type_embeddings: base + delta 
+        token_type_embeddings, diff_token_type_embeddings = self.token_type_embeddings.forward_delta(token_type_ids)
+
+        embeddings = inputs_embeds + token_type_embeddings
+        diff_embeddings = diff_inputs_embeds + diff_token_type_embeddings
+
+        # position_embeddings: only in absolute
+        if self.position_embedding_type == "absolute":
+            position_embeddings, diff_position_embeddings = self.position_embeddings.forward_delta(position_ids)
+
+            embeddings = embeddings + position_embeddings
+            diff_embeddings = diff_embeddings + diff_position_embeddings
+
+        # diffLayerNorm 
+        embeddings, diff_embeddings = self.LayerNorm.forward_delta(embeddings, diff_embeddings,)
+
+        embeddings_perturbed = self.dropout(embeddings + diff_embeddings)
+        embeddings = self.dropout(embeddings)
+        diff_embeddings = embeddings_perturbed - embeddings
+
+        return embeddings, diff_embeddings
+
 
     def create_position_ids_from_inputs_embeds(self, inputs_embeds):
         """
@@ -180,7 +346,7 @@ class RobertaEmbeddings(nn.Module):
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfAttention with Bert->Roberta
 class RobertaSelfAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, layer_idx, position_embedding_type=None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -191,15 +357,40 @@ class RobertaSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        if getattr(config, "apply_lora", False):
+        
+        use_diff = getattr(config, "apply_forward_delta", False)
+        prefix = f"roberta.encoder.layer.{layer_idx}.attention.self"
+        
+        # query
+        if use_diff:
+            self.query = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
+                                     layer_name = f"{prefix}.query", 
+                                     in_features = config.hidden_size, out_features = self.all_head_size, bias=True,
+                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
+                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        elif getattr(config, "apply_lora", False):
             self.query = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
         else:
             self.query = nn.Linear(config.hidden_size, self.all_head_size)
         
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-
-        if getattr(config, "apply_lora", False):
+        # key
+        if use_diff:
+            self.key = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
+                                     layer_name = f"{prefix}.key", 
+                                     in_features = config.hidden_size, out_features = self.all_head_size, bias=True,
+                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
+                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        else:
+            self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        
+        # value
+        if use_diff:
+            self.value = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
+                                     layer_name = f"{prefix}.value", 
+                                     in_features = config.hidden_size, out_features = self.all_head_size, bias=True,
+                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
+                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        elif getattr(config, "apply_lora", False):
             self.value = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
         else:
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
@@ -319,14 +510,188 @@ class RobertaSelfAttention(nn.Module):
         if self.is_decoder or output_key_value:
             outputs = outputs + (past_key_value,)
         return outputs
+    
+    def forward_delta(
+        self,
+        hidden_states: torch.Tensor,
+        diff_hidden_states: torch.Tensor, 
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+        output_key_value: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        
+        # 目前只支持 encoder 自注意力路径（最常见的 RoBERTa 场景）
+        if encoder_hidden_states is not None or past_key_value is not None:
+            raise NotImplementedError("forward_delta currently only supports encoder self-attention "
+                                      "(no encoder_hidden_states, no past_key_value).")
+        
+        if hasattr(self.query, "forward_delta"):
+            mixed_query_layer, diff_mixed_query_layer = self.query.forward_delta(
+                hidden_states, diff_hidden_states
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.query has no forward_delta. "
+                f"Expected QdiffLinear when apply_forward_delta=True. "
+                f"query type={type(self.query)}"
+            )
+            # mixed_query_layer = self.query(hidden_states)
+            # diff_mixed_query_layer = torch.zeros_like(mixed_query_layer)
+
+        if hasattr(self.key, "forward_delta"):
+            key_proj, diff_key_proj = self.key.forward_delta(hidden_states, diff_hidden_states)
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.key has no forward_delta. "
+                f"Expected QdiffLinear when apply_forward_delta=True. "
+                f"key type={type(self.key)}"
+            )
+            # key_proj = self.key(hidden_states)
+            # diff_key_proj = torch.zeros_like(key_proj)
+
+        if hasattr(self.value, "forward_delta"):
+            value_proj, diff_value_proj = self.value.forward_delta(hidden_states, diff_hidden_states)
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.value has no forward_delta. "
+                f"Expected QdiffLinear when apply_forward_delta=True. "
+                f"value type={type(self.value)}"
+            )
+            # value_proj = self.value(hidden_states)
+            # diff_value_proj = torch.zeros_like(value_proj)
+            
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+        diff_query_layer = self.transpose_for_scores(diff_mixed_query_layer)
+
+        key_layer = self.transpose_for_scores(key_proj)
+        diff_key_layer = self.transpose_for_scores(diff_key_proj)
+        
+        value_layer = self.transpose_for_scores(value_proj)
+        diff_value_layer = self.transpose_for_scores(diff_value_proj)
+        
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+       
+        attention_scores_perturbed = torch.matmul(
+            query_layer + diff_query_layer,
+            (key_layer + diff_key_layer).transpose(-1, -2),
+        )
+        diff_attention_scores = attention_scores_perturbed - attention_scores
+        
+        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
+            query_length, key_length = query_layer.shape[2], key_layer.shape[2]
+            
+            # only encoder: no use_cache
+            position_ids_l = torch.arange(query_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
+            position_ids_r = torch.arange(key_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
+            distance = position_ids_l - position_ids_r
+
+            positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
+            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
+            
+            if self.position_embedding_type == "relative_key":
+                relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
+                attention_scores = attention_scores + relative_position_scores
+
+                # diff
+                relative_position_scores_perturbed = torch.einsum(
+                    "bhld,lrd->bhlr", query_layer + diff_query_layer, positional_embedding
+                )
+                diff_relative_scores = relative_position_scores_perturbed - relative_position_scores
+                diff_attention_scores = diff_attention_scores + diff_relative_scores
+
+            elif self.position_embedding_type == "relative_key_query":
+                relative_position_scores_query = torch.einsum(
+                    "bhld,lrd->bhlr", query_layer, positional_embedding
+                )
+                relative_position_scores_key = torch.einsum(
+                    "bhrd,lrd->bhlr", key_layer, positional_embedding
+                )
+                attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
+
+                # diff
+                relative_position_scores_query_perturbed = torch.einsum(
+                    "bhld,lrd->bhlr", query_layer + diff_query_layer, positional_embedding
+                )
+                relative_position_scores_key_perturbed = torch.einsum(
+                    "bhrd,lrd->bhlr", key_layer + diff_key_layer, positional_embedding
+                )
+                diff_relative_scores = (
+                    (relative_position_scores_query_perturbed + relative_position_scores_key_perturbed)
+                    - (relative_position_scores_query + relative_position_scores_key)
+                )
+                diff_attention_scores = diff_attention_scores + diff_relative_scores
+                
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        diff_attention_scores = diff_attention_scores / math.sqrt(self.attention_head_size)
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+            # diff_attention_scores = (S + M + ΔS) - (S + M) = ΔS 无需加attention_mask
+        
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs_perturbed = nn.functional.softmax(
+            attention_scores + diff_attention_scores,
+            dim=-1,
+        )
+        # diff_attention_probs = attention_probs_perturbed - attention_probs
+        
+        attention_probs_perturbed = self.dropout(attention_probs_perturbed)
+        attention_probs = self.dropout(attention_probs)
+        diff_attention_probs = attention_probs_perturbed - attention_probs
+
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+            diff_attention_probs = diff_attention_probs * head_mask
+
+        context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer_perturbed = torch.matmul(
+            attention_probs + diff_attention_probs,
+            value_layer + diff_value_layer,
+        )
+        diff_context_layer = context_layer_perturbed - context_layer
+
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        diff_context_layer = diff_context_layer.permute(0, 2, 1, 3).contiguous()
+
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(new_context_layer_shape)
+        diff_context_layer = diff_context_layer.view(new_context_layer_shape)
+
+        if output_attentions:
+            outputs = (context_layer, diff_context_layer, attention_probs, diff_attention_probs)
+        else:
+            outputs = (context_layer, diff_context_layer)
+
+        # 目前不支持 cache 的 delta，统一不返回 past_key_value
+        if self.is_decoder or output_key_value:
+            raise NotImplementedError("forward_delta does not yet support returning key/value cache.")
+
+        return outputs
+
 
 
 # Copied from transformers.models.bert.modeling_bert.BertSelfOutput
 class RobertaSelfOutput(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        use_diff = getattr(config, "apply_forward_delta", False)
+        prefix = f"roberta.encoder.layer.{layer_idx}.attention.output"
+        if use_diff:
+            self.dense = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
+                                     layer_name = f"{prefix}.dense", 
+                                     in_features = config.hidden_size, out_features = config.hidden_size, bias=True,
+                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
+                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if use_diff:
+            self.LayerNorm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name=f"{prefix}.LayerNorm", z_provider=config.z_provider)
+        else:
+            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -334,14 +699,56 @@ class RobertaSelfOutput(nn.Module):
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
+    
+    def forward_delta(self, hidden_states: torch.Tensor, diff_hidden_states: torch.Tensor, input_tensor: torch.Tensor, diff_input_tensor: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(self.dense, "forward_delta"):
+            dense_out, diff_dense_out = self.dense.forward_delta(
+                hidden_states,
+                diff_hidden_states,
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.dense has no forward_delta. "
+                f"Expected QdiffLinear when apply_forward_delta=True. "
+                f"dense type={type(self.dense)}"
+            )
+            # dense_out = self.dense(hidden_states)
+            # diff_dense_out = self.dense(diff_hidden_states)
+
+        dense_out_perturbed = self.dropout(dense_out + diff_dense_out)
+        dense_out = self.dropout(dense_out)
+        diff_dense_out = dense_out_perturbed - dense_out
+
+        # base:
+        residual = dense_out + input_tensor
+        # delta: dy = d(dense_out) + d(input_tensor)
+        diff_residual = diff_dense_out + diff_input_tensor
+
+        if hasattr(self.LayerNorm, "forward_delta"):
+            output, diff_output = self.LayerNorm.forward_delta(
+                residual,
+                diff_residual,
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.LayerNorm has no forward_delta. "
+                f"Expected diffLayerNorm when apply_forward_delta=True. "
+                f"LayerNorm type={type(self.LayerNorm)}"
+            )
+            # base_out = self.LayerNorm(residual)
+            # perturbed_out = self.LayerNorm(residual + diff_residual)
+            # diff_output = perturbed_out - base_out
+            # output = base_out
+
+        return output, diff_output
 
 
 # Copied from transformers.models.bert.modeling_bert.BertAttention with Bert->Roberta
 class RobertaAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None):
+    def __init__(self, config, layer_idx, position_embedding_type=None):
         super().__init__()
-        self.self = RobertaSelfAttention(config, position_embedding_type=position_embedding_type)
-        self.output = RobertaSelfOutput(config)
+        self.self = RobertaSelfAttention(config, position_embedding_type=position_embedding_type, layer_idx = layer_idx)
+        self.output = RobertaSelfOutput(config, layer_idx = layer_idx)
         self.pruned_heads = set()
 
     def prune_heads(self, heads):
@@ -386,13 +793,56 @@ class RobertaAttention(nn.Module):
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
+    
+    def forward_delta(
+        self,
+        hidden_states: torch.Tensor,
+        diff_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+        output_key_value: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        self_outputs = self.self.forward_delta(
+            hidden_states = hidden_states,
+            diff_hidden_states = diff_hidden_states,
+            attention_mask = attention_mask,
+            head_mask = head_mask,
+            encoder_hidden_states = encoder_hidden_states,
+            encoder_attention_mask = encoder_attention_mask,
+            past_key_value = past_key_value,
+            output_attentions = output_attentions,
+            output_key_value=output_key_value
+        )
+        context_layer, diff_context_layer = self_outputs[:2]
+        attention_output, diff_attention_output = self.output.forward_delta(
+            hidden_states=context_layer,
+            diff_hidden_states=diff_context_layer,
+            input_tensor=hidden_states,           # 残差
+            diff_input_tensor=diff_hidden_states, # 残差的 delta
+        )
+        outputs = (attention_output, diff_attention_output) + self_outputs[2:]
+        return outputs
 
 
 # Copied from transformers.models.bert.modeling_bert.BertIntermediate
 class RobertaIntermediate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,layer_idx):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        use_diff = getattr(config, "apply_forward_delta", False)
+        prefix = f"roberta.encoder.layer.{layer_idx}.intermediate"
+        if use_diff:
+            self.dense = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
+                                     layer_name = f"{prefix}.dense", 
+                                     in_features = config.hidden_size, out_features = config.intermediate_size, bias=True,
+                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
+                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+            
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -402,14 +852,46 @@ class RobertaIntermediate(nn.Module):
         hidden_states = self.dense(hidden_states)
         hidden_states = self.intermediate_act_fn(hidden_states)
         return hidden_states
+    
+    def forward_delta(self, hidden_states: torch.Tensor, diff_hidden_states) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(self.dense, "forward_delta"):
+            hidden, diff_hidden = self.dense.forward_delta(
+                hidden_states,
+                diff_hidden_states,
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.dense has no forward_delta. "
+                f"Expected QdiffLinear when apply_forward_delta=True. dense type={type(self.dense)}"
+            )
+            # hidden = self.dense(hidden_states)
+            # diff_hidden = self.dense(diff_hidden_states)
+
+        activated = self.intermediate_act_fn(hidden)
+        activated_perturbed = self.intermediate_act_fn(hidden + diff_hidden)
+        diff_activated = activated_perturbed - activated
+
+        return activated, diff_activated
 
 
 # Copied from transformers.models.bert.modeling_bert.BertOutput
 class RobertaOutput(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        use_diff =  getattr(config, "apply_forward_delta", False)
+        prefix = f"roberta.encoder.layer.{layer_idx}.output"
+        if use_diff:
+            self.dense = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
+                                     layer_name = f"{prefix}.dense", 
+                                     in_features = config.intermediate_size, out_features = config.hidden_size, bias=True,
+                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
+                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        else:
+            self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        if use_diff:
+            self.LayerNorm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name=f"{prefix}.LayerNorm", z_provider=config.z_provider)
+        else:
+            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -417,23 +899,64 @@ class RobertaOutput(nn.Module):
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
+    
+    def forward_delta(self, hidden_states: torch.Tensor, diff_hidden_states: torch.Tensor, input_tensor: torch.Tensor, diff_input_tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(self.dense, "forward_delta"):
+            dense_out, diff_dense_out = self.dense.forward_delta(
+                hidden_states,
+                diff_hidden_states,
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.dense has no forward_delta. "
+                f"Expected QdiffLinear when apply_forward_delta=True. dense type={type(self.dense)}"
+            )
+            # dense_out = self.dense(hidden_states)
+            # diff_dense_out = self.dense(diff_hidden_states)
+        
+        dense_out_perturbed = self.dropout(dense_out + diff_dense_out)
+        dense_out = self.dropout(dense_out)
+        diff_dense_out = dense_out_perturbed - dense_out
+
+        residual = dense_out + input_tensor
+        diff_residual = diff_dense_out + diff_input_tensor
+
+        if hasattr(self.LayerNorm, "forward_delta"):
+            output, diff_output = self.LayerNorm.forward_delta(
+                residual,
+                diff_residual,
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.layernorm has no forward_delta. "
+                f"Expected diffLayernorm when apply_forward_delta=True. dense type={type(self.LayerNorm)}"
+            )
+            # base_out = self.LayerNorm(residual)
+            # perturbed_out = self.LayerNorm(residual + diff_residual)
+            # diff_output = perturbed_out - base_out
+            # output = base_out
+
+        return output, diff_output
 
 
 # Copied from transformers.models.bert.modeling_bert.BertLayer with Bert->Roberta
 class RobertaLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, layer_idx):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = RobertaAttention(config)
+        
+        self.layer_idx = layer_idx
+        
+        self.attention = RobertaAttention(config, layer_idx = layer_idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
         if self.add_cross_attention:
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
-            self.crossattention = RobertaAttention(config, position_embedding_type="absolute")
-        self.intermediate = RobertaIntermediate(config)
-        self.output = RobertaOutput(config)
+            self.crossattention = RobertaAttention(config, position_embedding_type="absolute", layer_idx = layer_idx)
+        self.intermediate = RobertaIntermediate(config, layer_idx = layer_idx)
+        self.output = RobertaOutput(config, layer_idx = layer_idx)
 
     def forward(
         self,
@@ -506,6 +1029,65 @@ class RobertaLayer(nn.Module):
         intermediate_output = self.intermediate(attention_output)
         layer_output = self.output(intermediate_output, attention_output)
         return layer_output
+    
+    def forward_delta(
+        self,
+        hidden_states: torch.Tensor,
+        diff_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+        output_key_value: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        """
+        forward 的 delta 版本，目前只支持：
+          - encoder 自注意力（RoBERTa 标准用法）
+          - 不支持 cross-attention / decoder / use_cache
+        """
+        if (self.is_decoder or self.add_cross_attention or encoder_hidden_states is not None or past_key_value is not None):
+            raise NotImplementedError(
+                "RobertaLayer.forward_delta currently only supports encoder self-attention "
+                "(no decoder, no cross-attention, no past_key_value)."
+            )
+
+        self_attention_outputs = self.attention.forward_delta(
+            hidden_states=hidden_states,
+            diff_hidden_states=diff_hidden_states,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            output_key_value=output_key_value,
+        )
+        # output_attentions=False: (attn_out, diff_attn_out)
+        # output_attentions=True:  (attn_out, diff_attn_out, attn_probs, diff_attn_probs)
+        attention_output, diff_attention_output = self_attention_outputs[:2]
+        extra_outputs = self_attention_outputs[2:]  # 可能为空，也可能是 (attn_probs, diff_attn_probs)
+
+        # FFN（intermediate + output）的 delta
+        # 这里不再做 chunking，直接一次性算完整序列；
+        # 标准路径 RoBERTa 默认 chunk_size_feed_forward=0，本来就不 chunk
+        intermediate_output, diff_intermediate_output = self.intermediate.forward_delta(
+            attention_output,
+            diff_attention_output,
+        )
+
+        layer_output, diff_layer_output = self.output.forward_delta(
+            hidden_states=intermediate_output,
+            diff_hidden_states=diff_intermediate_output,
+            input_tensor=attention_output,
+            diff_input_tensor=diff_attention_output,
+        )
+
+        outputs = (layer_output, diff_layer_output) + tuple(extra_outputs)
+        # 不支持 cache，所以没有 present_key_value
+        return outputs
+
 
 
 # Copied from transformers.models.bert.modeling_bert.BertEncoder with Bert->Roberta
@@ -513,7 +1095,8 @@ class RobertaEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.layer = nn.ModuleList([RobertaLayer(config) for _ in range(config.num_hidden_layers)])
+        # 新增layer_idx以传入Encoder层下diff层的layername
+        self.layer = nn.ModuleList([RobertaLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -606,13 +1189,167 @@ class RobertaEncoder(nn.Module):
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
         )
+        
+    def forward_delta(
+        self,
+        hidden_states: torch.Tensor,
+        diff_hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = False,
+        output_hidden_states: Optional[bool] = False,
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithDelta]:
+        """
+        在 RoBERTa encoder 标准路径下（encoder-only、自注意力）的 delta 版本：
+        """
+        # 检查：只针对 encoder-only RoBERTa
+        if use_cache:
+            raise NotImplementedError("RobertaEncoder.forward_delta does not support use_cache / KV cache.")
+        use_cache = False
+
+        if self.config.is_decoder or self.config.add_cross_attention:
+            raise NotImplementedError(
+                "RobertaEncoder.forward_delta 目前只支持 encoder-only RoBERTa (is_decoder=False, add_cross_attention=False)."
+            )
+        if encoder_hidden_states is not None or encoder_attention_mask is not None:
+            raise NotImplementedError(
+                "forward_delta 默认路径下不支持 encoder_hidden_states / encoder_attention_mask（encoder-only RoBERTa 用不到）。"
+            )
+        if past_key_values is not None:
+            raise NotImplementedError(
+                "forward_delta 目前不支持 past_key_values（encoder-only RoBERTa 一般不用 cache）。"
+            )
+
+        all_hidden_states = () if output_hidden_states else None
+        all_diff_hidden_states = () if output_hidden_states else None
+
+        all_self_attentions = () if output_attentions else None
+        all_diff_self_attentions = () if output_attentions else None
+
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False` in forward_delta..."
+                )
+                use_cache = False
+
+        next_decoder_cache = () if use_cache else None  
+
+        for i, layer_module in enumerate(self.layer):
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (hidden_states,)
+                all_diff_hidden_states = all_diff_hidden_states + (diff_hidden_states,)
+
+            layer_head_mask = head_mask[i] if head_mask is not None else None
+            layer_past_key_value = past_key_values[i] if past_key_values is not None else None
+            if layer_past_key_value is not None:
+                raise NotImplementedError(
+                    "forward_delta 暂不支持 per-layer past_key_value（encoder-only RoBERTa 一般不用）。"
+                )
+
+            if self.gradient_checkpointing and self.training:
+
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        hs, diff_hs, attn_mask, layer_hm, enc_hs, enc_attn_mask = inputs
+                        return module.forward_delta(
+                            hs,
+                            diff_hs,
+                            attn_mask,
+                            layer_hm,
+                            enc_hs,
+                            enc_attn_mask,
+                            layer_past_key_value,
+                            output_attentions,
+                            output_key_value=use_cache,
+                        )
+
+                    return custom_forward
+
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer_module),
+                    hidden_states,
+                    diff_hidden_states,
+                    attention_mask,
+                    layer_head_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                )
+            else:
+                layer_outputs = layer_module.forward_delta(
+                    hidden_states,
+                    diff_hidden_states,
+                    attention_mask,
+                    layer_head_mask,
+                    encoder_hidden_states,
+                    encoder_attention_mask,
+                    layer_past_key_value,
+                    output_attentions,
+                    output_key_value=use_cache,
+                )
+
+            hidden_states, diff_hidden_states = layer_outputs[:2]
+
+            # cache（encoder-only 下一般不用）
+            if use_cache:
+                next_decoder_cache += (layer_outputs[-1],)
+
+            # output_attentions=False: (layer_out, diff_layer_out)
+            # output_attentions=True : (layer_out, diff_layer_out, attn_probs, diff_attn_probs, [present_kv...])
+            if output_attentions:
+                attn_probs, diff_attn_probs = layer_outputs[2:4]
+                all_self_attentions = all_self_attentions + (attn_probs,)
+                all_diff_self_attentions = all_diff_self_attentions + (diff_attn_probs,)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+            all_diff_hidden_states = all_diff_hidden_states + (diff_hidden_states,)
+
+        if not return_dict:
+            return tuple(
+                v
+                for v in [
+                    hidden_states,             # last_hidden_state
+                    diff_hidden_states,        
+                    next_decoder_cache,        
+                    all_hidden_states,         
+                    all_diff_hidden_states,    
+                    all_self_attentions,       
+                    all_diff_self_attentions,  
+                    # cross-attentions 在 encoder-only 下为 None，这里不扩展 diff_cross_attentions 进 tuple
+                ]
+                if v is not None
+            )
+
+        # return_dict=True：BaseModelOutputWithDelta
+        return BaseModelOutputWithDelta(
+            last_hidden_state=hidden_states,
+            diff_last_hidden_state=diff_hidden_states,
+            past_key_values=next_decoder_cache,
+            hidden_states=all_hidden_states,
+            diff_hidden_states=all_diff_hidden_states,
+            attentions=all_self_attentions,
+            diff_attentions=all_diff_self_attentions,
+            # 我们的 forward_delta 中只支持 encoder-only 标准路径下的 RoBERTa 没有 cross-attention，这两个就保持 None
+            cross_attentions=None,
+            diff_cross_attentions=None,
+        )
 
 
 # Copied from transformers.models.bert.modeling_bert.BertPooler
 class RobertaPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        use_diff =  getattr(config, "apply_forward_delta", False)
+        if use_diff:
+            self.dense = diffLinear(layer_name = "roberta.pooler.dense", in_features = config.hidden_size, out_features = config.hidden_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -622,6 +1359,29 @@ class RobertaPooler(nn.Module):
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
         return pooled_output
+    
+    def forward_delta(self, hidden_states: torch.Tensor, diff_hidden_states: torch.Tensor,) -> Tuple[torch.Tensor, torch.Tensor]:
+        first_token_tensor = hidden_states[:, 0]           
+        diff_first_token_tensor = diff_hidden_states[:, 0]  
+
+        if hasattr(self.dense, "forward_delta"):
+            pooled, diff_pooled = self.dense.forward_delta(
+                first_token_tensor,
+                diff_first_token_tensor,
+            )
+        else:
+            raise NotImplementedError(
+                f"{self.__class__.__name__}.dense has no forward_delta; "
+                f"expected diffLinear when apply_forward_delta=True. dense type={type(self.dense)}"
+            )
+            # pooled = self.dense(first_token_tensor)
+            # diff_pooled = self.dense(diff_first_token_tensor)
+
+        pooled_activated = self.activation(pooled)
+        pooled_activated_perturbed = self.activation(pooled + diff_pooled)
+        diff_pooled_activated = pooled_activated_perturbed - pooled_activated
+
+        return pooled_activated, diff_pooled_activated
 
 
 class RobertaPreTrainedModel(PreTrainedModel):
@@ -917,6 +1677,146 @@ class RobertaModel(RobertaPreTrainedModel):
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
         )
+        
+    def forward_delta(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPoolingAndDelta]:
+        
+        if past_key_values is not None:
+            raise NotImplementedError("RobertaModel.forward_delta does not support past_key_values.")
+        if use_cache:
+            raise NotImplementedError("RobertaModel.forward_delta does not support use_cache / KV cache.")
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            raise NotImplementedError("forward_delta does not support inputs_embeds; pass input_ids instead.")
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        batch_size, seq_length = input_shape
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        # past_key_values_length
+        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+
+        if attention_mask is None:
+            attention_mask = torch.ones(((batch_size, seq_length + past_key_values_length)), device=device)
+
+        if token_type_ids is None:
+            if hasattr(self.embeddings, "token_type_ids"):
+                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
+                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
+                token_type_ids = buffered_token_type_ids_expanded
+            else:
+                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+
+        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
+
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        if hasattr(self.embeddings, "forward_delta"):
+            embedding_output, diff_embedding_output = self.embeddings.forward_delta(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                token_type_ids=token_type_ids,
+                inputs_embeds=inputs_embeds,
+                past_key_values_length=past_key_values_length,
+            )
+        else:
+            raise NotImplementedError("RobertaEmbeddings has no forward_delta ...")
+            # embedding_output = self.embeddings(
+            #     input_ids=input_ids,
+            #     position_ids=position_ids,
+            #     token_type_ids=token_type_ids,
+            #     inputs_embeds=inputs_embeds,
+            #     past_key_values_length=past_key_values_length,
+            # )
+            # diff_embedding_output = torch.zeros_like(embedding_output)
+
+        encoder_outputs = self.encoder.forward_delta(
+            hidden_states=embedding_output,
+            diff_hidden_states=diff_embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        if return_dict:
+            sequence_output = encoder_outputs.last_hidden_state
+            diff_sequence_output = encoder_outputs.diff_last_hidden_state
+        else:
+            # tuple 模式下：encoder_outputs[0], [1] 分别是 base / diff
+            sequence_output, diff_sequence_output = encoder_outputs[:2]
+
+        if self.pooler is not None:
+            if hasattr(self.pooler, "forward_delta"):
+                pooled_output, diff_pooled_output = self.pooler.forward_delta(
+                    sequence_output,
+                    diff_sequence_output,
+                )
+            else:
+                raise NotImplementedError("Robertapooler has no forward_delta ...")
+                # pooled_output = self.pooler(sequence_output)
+                # diff_pooled_output = torch.zeros_like(pooled_output) if pooled_output is not None else None
+        else:
+            pooled_output = None
+            diff_pooled_output = None
+
+        if not return_dict:
+            return (sequence_output, diff_sequence_output, pooled_output, diff_pooled_output) + encoder_outputs[2:]
+
+        # return_dict=True：返回我们自定义的 BaseModelOutputWithPoolingAndDelta
+        return BaseModelOutputWithPoolingAndDelta(
+            last_hidden_state=sequence_output,
+            diff_last_hidden_state=diff_sequence_output,
+            pooler_output=pooled_output,
+            diff_pooler_output=diff_pooled_output,
+            past_key_values=encoder_outputs.past_key_values,
+            hidden_states=encoder_outputs.hidden_states,
+            diff_hidden_states=getattr(encoder_outputs, "diff_hidden_states", None),
+            attentions=encoder_outputs.attentions,
+            diff_attentions=getattr(encoder_outputs, "diff_attentions", None),
+            cross_attentions=getattr(encoder_outputs, "cross_attentions", None),
+            diff_cross_attentions=getattr(encoder_outputs, "diff_cross_attentions", None),
+        )
 
 
 @add_start_docstrings(
@@ -1053,7 +1953,131 @@ class RobertaForCausalLM(RobertaPreTrainedModel):
             attentions=outputs.attentions,
             cross_attentions=outputs.cross_attentions,
         )
+        
+    def forward_delta(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        past_key_values: Tuple[Tuple[torch.FloatTensor]] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple[torch.Tensor, ...], CausalLMOutputWithDelta]:
+            
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        if labels is not None:
+            use_cache = False
 
+        roberta_outputs = self.roberta.forward_delta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,   # 这里强制 dict，下面统一用字段
+        )
+
+        sequence_output = roberta_outputs.last_hidden_state           # [B, L, H]
+        diff_sequence_output = roberta_outputs.diff_last_hidden_state # [B, L, H]
+
+        
+        logits_base, diff_logits = self.lm_head.forward_delta(sequence_output, diff_sequence_output)  # base logits
+        logits_perturbed = logits_base + diff_logits
+        # diff_prediction_scores = prediction_scores_perturbed - prediction_scores
+
+        loss_base = None
+        loss_perturbed = None
+        if labels is not None:
+            # next-token 预测：logits/labels 右移一位对齐
+            shifted_labels = labels[:, 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+
+            shifted_base = logits_base[:, :-1, :].contiguous()
+            loss_base = loss_fct(
+                shifted_base.view(-1, self.config.vocab_size),
+                shifted_labels.view(-1),
+            )
+            
+            shifted_pert = logits_perturbed[:, :-1, :].contiguous()
+            loss_perturbed = loss_fct(
+                shifted_pert.view(-1, self.config.vocab_size),
+                shifted_labels.view(-1),
+            )
+        
+        hidden_states = roberta_outputs.hidden_states
+        diff_hidden_states = getattr(roberta_outputs, "diff_hidden_states", None)
+        if hidden_states is not None and diff_hidden_states is not None:
+            perturbed_hidden_states = tuple(
+                h + dh for h, dh in zip(hidden_states, diff_hidden_states)
+            )
+        else:
+            perturbed_hidden_states = None
+
+        attentions = roberta_outputs.attentions
+        diff_attentions = getattr(roberta_outputs, "diff_attentions", None)
+        if attentions is not None and diff_attentions is not None:
+            perturbed_attentions = tuple(
+                a + da for a, da in zip(attentions, diff_attentions)
+            )
+        else:
+            perturbed_attentions = None
+
+        cross_attentions = roberta_outputs.cross_attentions
+        diff_cross_attentions = getattr(roberta_outputs, "diff_cross_attentions", None)
+        if cross_attentions is not None and diff_cross_attentions is not None:
+            perturbed_cross_attentions = tuple(
+                ca + dca for ca, dca in zip(cross_attentions, diff_cross_attentions)
+            )
+        else:
+            perturbed_cross_attentions = None
+
+        if not return_dict:
+            output = (
+                logits_base,
+                logits_perturbed,
+                roberta_outputs.past_key_values,
+                hidden_states,
+                perturbed_hidden_states,
+                attentions,
+                perturbed_attentions,
+                cross_attentions,
+                perturbed_cross_attentions,
+            )
+            if loss_base is not None:
+                return (loss_base, loss_perturbed) + output
+            else:
+                return output
+            
+        # return_dict=True：返回我们自定义的 CausalLMOutputWithDelta
+        return CausalLMOutputWithDelta(
+            loss_base=loss_base,
+            loss_perturbed=loss_perturbed,
+            logits=logits_base,
+            perturbed_logits=logits_perturbed,
+            past_key_values=roberta_outputs.past_key_values,
+            hidden_states=hidden_states,
+            perturbed_hidden_states=perturbed_hidden_states,
+            attentions=attentions,
+            perturbed_attentions=perturbed_attentions,
+            cross_attentions=cross_attentions,
+            perturbed_cross_attentions=perturbed_cross_attentions,
+        )
+        
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, **model_kwargs):
         input_shape = input_ids.shape
         # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
@@ -1168,6 +2192,101 @@ class RobertaForMaskedLM(RobertaPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    
+    def forward_delta(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+    ) -> Union[Tuple[torch.Tensor, ...], MaskedLMOutputWithDelta]:
+        
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        roberta_outputs = self.roberta.forward_delta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,   # 强制 dict，方便取字段
+        )
+
+        hidden_base = roberta_outputs.last_hidden_state           # [B, L, H] base
+        # hidden_perturbed = sequence_output + roberta_outputs.diff_last_hidden_state
+
+        logits_base, diff_logits = self.lm_head.forward_delta(hidden_base, diff_last_hidden_state)          # [B, L, V]
+        logits_perturbed = logits_base + diff_logits
+
+        loss_base = None
+        loss_perturbed = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss_base = loss_fct(
+                logits_base.view(-1, self.config.vocab_size),
+                labels.view(-1),
+            )
+            loss_perturbed = loss_fct(
+                logits_perturbed.view(-1, self.config.vocab_size),
+                labels.view(-1),
+            )
+
+        # 重建中间层的 perturbed hidden / attentions（base + diff）
+        hidden_states = roberta_outputs.hidden_states
+        diff_hidden_states = getattr(roberta_outputs, "diff_hidden_states", None)
+        if hidden_states is not None and diff_hidden_states is not None:
+            perturbed_hidden_states = tuple(
+                h + dh for h, dh in zip(hidden_states, diff_hidden_states)
+            )
+        else:
+            perturbed_hidden_states = None
+
+        attentions = roberta_outputs.attentions
+        diff_attentions = getattr(roberta_outputs, "diff_attentions", None)
+        if attentions is not None and diff_attentions is not None:
+            perturbed_attentions = tuple(
+                a + da for a, da in zip(attentions, diff_attentions)
+            )
+        else:
+            perturbed_attentions = None
+
+        if not return_dict:
+            output = (
+                logits_base,
+                logits_perturbed,
+                hidden_states,
+                perturbed_hidden_states,
+                attentions,
+                perturbed_attentions,
+            )
+            if loss_base is not None:
+                return (loss_base, loss_perturbed) + output
+            else:
+                return output
+
+        return MaskedLMOutputWithDelta(
+            loss_base=loss_base,
+            loss_perturbed=loss_perturbed,
+            logits=logits_base,
+            perturbed_logits=logits_perturbed,
+            hidden_states=hidden_states,
+            perturbed_hidden_states=perturbed_hidden_states,
+            attentions=attentions,
+            perturbed_attentions=perturbed_attentions,
+        )
 
 
 class RobertaLMHead(nn.Module):
@@ -1175,12 +2294,23 @@ class RobertaLMHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
-        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
-        self.decoder.bias = self.bias
+        use_diff = getattr(config, "apply_forward_delta", False)
+        if use_diff:
+            self.dense = diffLinear(layer_name = "lm_head.dense", in_features = config.hidden_size, out_features = config.hidden_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider,)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if use_diff:
+            self.layer_norm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name="lm_head.layer_norm", z_provider=config.z_provider)
+        else:
+            self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        if use_diff:
+            self.decoder = diffLinear(layer_name = "lm_head.decoder", in_features = config.hidden_size, out_features = config.vocab_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider)
+        else:
+            self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
+        
+        # self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        # self.decoder.bias = self.bias
+        self.bias = self.decoder.bias
 
     def forward(self, features, **kwargs):
         x = self.dense(features)
@@ -1191,6 +2321,26 @@ class RobertaLMHead(nn.Module):
         x = self.decoder(x)
 
         return x
+    
+    def forward_delta(self, features, diff_features=None, **kwargs):
+        if diff_features is None:
+            diff_features = torch.zeros_like(features)
+            
+        for name, m in [("dense", self.dense), ("layer_norm", self.layer_norm), ("decoder", self.decoder)]:
+            if not hasattr(m, "forward_delta"):
+                raise NotImplementedError(
+                    f"{self.__class__.__name__}.{name} has no forward_delta. "
+                    f"Expected diff modules when apply_forward_delta=True. type={type(m)}"
+                )
+
+        x, diff_x = self.dense.forward_delta(features, diff_features)
+        x_pert = x + diff_x 
+        x = gelu(x)
+        x_pert = gelu(x_pert)
+        l, diffl = self.layer_norm.forward_delta(x, x_pert-x)
+        l, diffl = self.decoder.forward_delta(l, diffl)
+    
+        return l, diffl
 
     def _tie_weights(self):
         # To tie those two weights if they get disconnected (on TPU or when the bias is resized)
@@ -1199,6 +2349,10 @@ class RobertaLMHead(nn.Module):
             self.decoder.bias = self.bias
         else:
             self.bias = self.decoder.bias
+            
+            
+#  --------------------------------------------------------------------------
+#  以上修改了delta的版本 对应着models.py中ForPromptFinetuning的版本
 
 
 @add_start_docstrings(
@@ -1483,12 +2637,21 @@ class RobertaClassificationHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        
+        use_diff = getattr(config, "apply_forward_delta", False)
+        # classifier.dense
+        if use_diff:
+            self.dense = diffLinear(layer_name = "classifier.dense", in_features = config.hidden_size, out_features = config.hidden_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider)
+        else:
+            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         classifier_dropout = (
             config.classifier_dropout if config.classifier_dropout is not None else config.hidden_dropout_prob
         )
         self.dropout = nn.Dropout(classifier_dropout)
-        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+        if use_diff:
+            self.out_proj = diffLinear(layer_name = "classifier.out_proj", in_features = config.hidden_size, out_features = config.num_labels, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider)
+        else:
+            self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
 
     def forward(self, features, **kwargs):
         x = features[:, 0, :]  # take <s> token (equiv. to [CLS])
@@ -1498,6 +2661,29 @@ class RobertaClassificationHead(nn.Module):
         x = self.dropout(x)
         x = self.out_proj(x)
         return x
+    
+    def forward_delta(self, features, diff_features=None, **kwargs):
+        if diff_features is None:
+            diff_features = torch.zeros_like(features)
+            
+        x_base = features[:, 0, :]         # [B, H]
+        dx = diff_features[:, 0, :]        # [B, H]
+        x_pert = x_base + dx
+        
+        x_base = self.dropout(x_base)
+        x_pert = self.dropout(x_pert)
+        dx = x_pert - x_base
+        
+        x_base, dx = self.dense.forward_delta(x_base, dx)
+        x_base = torch.tanh(x_base)
+        x_pert = torch.tanh(x_base + dx)
+        x_base = self.dropout(x_base)
+        x_pert = self.dropout(x_pert)
+        dx = x_pert - x_base
+        
+        x_base, dx = self.out_proj.forward_delta(x_base, dx)
+        return x_base, dx
+        
 
 
 @add_start_docstrings(

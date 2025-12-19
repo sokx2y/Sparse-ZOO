@@ -25,6 +25,10 @@ from src.models import MODEL_TYPES, resize_token_type_embeddings, convert_opt_mo
 from src.LOZOtrainer import LowRankTrainer
 from src.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
 from src.custom_linear import get_all_custom_layers, replace_linear_layers_with_custom
+from src.diff_linear import replace_linear_layers_with_differential, get_all_differential_layers, DifferentialLinear
+from src.diff_fake_quant import QdiffLinear, replace_linear_with_Qdifflinear, get_all_Qdifflayers
+from src.diff_fake_quant_mx import diffLinear, diffLayerNorm, diffEmbedding, QdiffLinear
+from src.diff_fake_quant_mx import QuantizeRobertaForLOZO
 
 from filelock import FileLock
 from datetime import datetime
@@ -217,6 +221,116 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
         default=100,
         metadata={"help": "每隔多少次推理绘制一次图表"}
     )
+    
+    # DiffLinear 相关参数
+    enable_differential_linear: bool = field(
+        default=False,
+        metadata={"help": "启用DifferentialLinear层来优化计算偶数次的output"}
+    )
+    
+    enable_differential_validation: bool = field(
+        default=False,
+        metadata={"help": "是否计算diff_linear与正常linear的误差"}
+    )
+    
+    enable_accurate_diff: bool = field(
+        default=False,
+        metadata={"help": "是否启用acc_diff_linear"}
+    )
+
+    differential_plot_dir: str = field(
+        default=None,
+        metadata={"help": "DifferentialLinear验证误差图保存目录"}
+    )
+
+    differential_reset_interval: int = field(
+        default=1000,
+        metadata={"help": "每隔多少次推理重置一次缓存状态（防止长时间运行的数值累积误差）"}
+    )
+
+    differential_validation_file: str = field(
+        default=None,
+        metadata={"help": "保存差分计算验证结果的JSON文件路径"}
+    )
+    
+    
+    # Quantize QdiffLinear 相关参数
+    enable_QdiffLinear: bool = field(
+        default=False,
+        metadata={"help":"Use QdiffLinear"}    
+    )
+    
+    mx_quan: bool = field(
+        default=False,
+        metadata={"help":"Use microxcaling to quantize model"}    
+    )
+
+    apply_forward_delta: bool = field(
+        default=False,
+        metadata={"help":"Use all difflayer in diff_fake_quant_mx.py"}
+    )
+    
+    mx_w_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for weight"}
+    )
+    
+    mx_a_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for activation"}
+    )
+    
+    mx_diffw_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for diff_weight in QdiffLinear"}
+    )
+    
+    mx_diffa_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for diff_input in QdiffLinear"}
+    )
+    
+    act_quant_pattern: str = field(
+        default="per_token",
+        metadata={"help": "Choose the pattern to quantize x and diffx"}
+    )
+    
+    act_bit: int = field(
+        default=8,
+        metadata={"help": "choose the quantization precision for x and diffx"}
+    )
+    
+    weight_bit: int = field(
+        default=8,
+        metadata={"help": "choose the quantization precision for w and diffw"}
+    )
+    
+    enable_x: bool = field(
+        default=False,
+        metadata={"help": "quantize activation_odd"}
+    )
+    
+    enable_diffx: bool = field(
+        default=False,
+        metadata={"help": "quantize diff_activation"}
+    )
+    
+    enable_w: bool = field(
+        default=False,
+        metadata={"help": "quantize weight_even"}
+    )
+    
+    enable_diffw: bool = field(
+        default=False,
+        metadata={"help": "quantize diff_weight"}
+    )
+    
+    use_uv_diffw: bool = field(
+        default=False,
+        metadata={"help": "use uv from lozotrainer to replace diff_weight during qunatization"}
+    )
+    
+
 
     # For max length
     double_demo: bool = field(
@@ -854,6 +968,18 @@ def main():
                 num_labels=num_labels,
                 finetuning_task=data_args.task_name,
                 cache_dir=model_args.cache_dir,
+                apply_forward_delta=data_args.apply_forward_delta,
+                # config其实无需修改， 真正的功能是后面的 replace 函数， provider 先在这里传 none , 目前是因为懒得修改了， 一些冗余的代码后面在修改，
+                uv_provider=None,   
+                z_provider=None,
+                enable_x=data_args.enable_x,
+                enable_diffx=data_args.enable_diffx,
+                enable_w=data_args.enable_w,
+                enable_diffw=data_args.enable_diffw,
+                mx_w_elem_format=data_args.mx_w_elem_format,
+                mx_a_elem_format=data_args.mx_a_elem_format,
+                mx_diffw_elem_format=data_args.mx_diffw_elem_format,
+                mx_diffa_elem_format=data_args.mx_diffa_elem_format,
                 **config_kwargs)
         else:
             config = OPTConfig.from_pretrained(
@@ -1001,6 +1127,23 @@ def main():
         logger.info(f"Replace All Linear Layers with CustomLinear Layers")
         
         print(f"model:{model}")
+        
+    # 启用DiffLinear功能
+    if data_args.enable_differential_linear:
+        logger.info("启用DifferentialLinear层来优化偶数次推理")
+        
+        # 创建保存目录
+        os.makedirs(data_args.differential_plot_dir, exist_ok=True)
+        
+        # 替换模型中的Linear层为DifferentialLinear层
+        logger.info(model)
+    
+        replace_linear_layers_with_differential(model, enable_validation=data_args.enable_differential_validation, enable_accurate_diff=data_args.enable_accurate_diff, max_steps=training_args.max_steps)
+        logger.info("Replace All Linear Layers with DifferentialLinear Layers")
+        
+        print(f"model:{model}")
+        
+        
     
     # Build metric
     def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
@@ -1047,6 +1190,36 @@ def main():
         data_collator=MyDataCollatorWithPadding(tokenizer),
         **trainer_kwargs
     )
+    
+    
+    # apply_forward_delta 
+    if data_args.apply_forward_delta:
+        logger.info("replacing nnlayers in model with difflayers")
+        uv_provider = trainer.make_uv_provider()
+        z_provider = trainer.make_z_provider()
+        
+        if model.config.model_type == "roberta":
+            QuantizeRobertaForLOZO(model=model,
+                                   mx_w_elem_format=data_args.mx_w_elem_format, mx_a_elem_format=data_args.mx_a_elem_format, mx_diffw_elem_format=data_args.mx_diffw_elem_format, mx_diffa_elem_format=data_args.mx_diffa_elem_format, 
+                                   enable_w=data_args.enable_w, enable_x=data_args.enable_x, enable_diffx=data_args.enable_diffx, enable_diffw=data_args.enable_diffw, 
+                                   uv_provider=uv_provider, z_provider=z_provider)
+        logger.info("Replace All nnLayers with diffLayers to support forward_delta")
+        print(f"model:{model}") 
+        
+    
+    # Use QdiffLinear
+    if data_args.enable_QdiffLinear:
+        logger.info("Use QdiffLinear to reduce the computing stress and accelerate LOZO")
+        logger.info(model)
+        
+        uv_provider = trainer.make_uv_provider()
+        
+        replace_linear_with_Qdifflinear(model=model, mx_quan=data_args.mx_quan, mx_w_elem_format=data_args.mx_w_elem_format, mx_a_elem_format=data_args.mx_a_elem_format, mx_diffw_elem_format=data_args.mx_diffw_elem_format, mx_diffa_elem_format=data_args.mx_diffa_elem_format, act_quant=data_args.act_quant_pattern, weight_quant="per_outchannel", act_b=data_args.act_bit, weight_b=data_args.weight_bit, enable_w=data_args.enable_w, enable_x=data_args.enable_x, enable_diffx=data_args.enable_diffx, enable_diffw=data_args.enable_diffw, max_steps=training_args.max_steps, use_uv_diffw=data_args.use_uv_diffw, uv_provider = uv_provider)
+        logger.info("Replace All Linear Layers with DifferentialLinear Layers")
+        # calculate and validate if QdiffLinear works successfully
+        Qdiff_layers = get_all_Qdifflayers(model)
+        logger.info(f"we find {len(Qdiff_layers)} QdiffLinears which are successfully replaced")
+        print(f"model:{model}")    
 
     # Calibration
     if model_args.sfc:
@@ -1088,7 +1261,7 @@ def main():
                 torch.save(model_args, os.path.join(training_args.output_dir, "model_args.bin"))
                 torch.save(data_args, os.path.join(training_args.output_dir, "data_args.bin"))
             
-            # if training_args.evaluate_during_training:
+            if training_args.evaluate_during_training:
                 # Reload the best checkpoint (for eval)
                 # model.load_state_dict(trainer.best_model_ckpt)
                 # if training_args.prefix_tuning:
@@ -1102,7 +1275,7 @@ def main():
                 # model = model.to(training_args.device)
                 
                 # Now we just reload this from memory instead of disk <-- much faster
-                # trainer.model.load_state_dict(trainer.best_model_ckpt)
+                trainer.model.load_state_dict(trainer.best_model_ckpt)
 
     # Evaluation
     final_result = {
@@ -1111,7 +1284,7 @@ def main():
     }
 
     eval_results = {}
-    if training_args.do_eval and data_args.custom_linear_plot_dir is None:
+    if training_args.do_eval :
         logger.info("*** Validate ***")
 
         eval_datasets = [eval_dataset]
@@ -1187,7 +1360,31 @@ def main():
         logger.info("开始绘制CustomLinear层的数据分布图...")
         plot_custom_linear_data(model, data_args)
     
+    
+    # 获取所有DifferentialLinear层
+    diff_layers = get_all_differential_layers(model)
+    logger.info(f"共找到 {len(diff_layers)} 个DifferentialLinear层")
+                
+    # 如果启用验证，绘制误差图
+    if data_args.enable_differential_validation:
+        logger.info("\n=== 验证结果分析 ===")
+        for i, layer in enumerate(diff_layers):
+            if layer.validation_errors and layer.sparsity_diff:
+                logger.info(f"\ndiff层 {layer.layer_name} ({layer.in_features}→{layer.out_features}):")
+                
+                # 绘制误差图
+                plot_path = os.path.join(data_args.differential_plot_dir, f'{layer.layer_name}.png')
+                # layer.plot_validation_errors(save_path=plot_path, show_plot=False)
+                layer.plot_sparsity_diff_distribution(save_path=plot_path, show_plot=False)
+                layer.plot_activation_weight_3d(save_path=plot_path)
+                logger.info(f"sparsity analyse 图已保存: {plot_path}")
+    
+    logger.info("\n测试完成！")
+    
+    
     return eval_results
+    
+    
 
 
 
