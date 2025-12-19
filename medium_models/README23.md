@@ -9,13 +9,14 @@
   同时，每一层还有 forward_delta（支持 base 以及 diff 的双重输入输出）， 为了支持一次 lowrank_forward 就可以得到两个 loss的算子实现
 
   其中，QdiffLinear的逻辑是： 
-  $$
-    \begin{aligned}
-    y_1 &= w_1 x + b_1 \\
-    y_2 &= (w_1 + dw)(x + dx) + b_2 \\
-        &= y_1 + dw\cdot x + w_1\cdot dx + dw\cdot dx + db
-    \end{aligned}
-  $$
+
+$$
+  \begin{aligned}
+  y_1 &= w_1 x + b_1 \\
+  y_2 &= (w_1 + dw)(x + dx) + b_2 \\
+      &= y_1 + dw\cdot x + w_1\cdot dx + dw\cdot dx + db
+  \end{aligned}
+$$
 
   其中，x，dx, w, dw 分别有相应的量化格式 
 
