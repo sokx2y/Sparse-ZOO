@@ -12,7 +12,7 @@ from typing import Union, Optional
 import torch
 from torch.nn.parameter import Parameter
 import numpy as np
-from dataclasses import dataclass, is_dataclass, asdict
+from dataclasses import dataclass, is_dataclass, asdict, field
 from tqdm import tqdm
 from tasks import get_task
 import json
@@ -23,6 +23,9 @@ from metrics import calculate_metric
 from utils import *
 from LOZOtrainer import LowRankTrainer
 import random
+from diff_fake_quant_mx import QuantizeOPTForLOZO
+from modeling_opt import OPTForCausalLM 
+
 
 @dataclass
 class OurArguments(TrainingArguments):
@@ -106,6 +109,59 @@ class OurArguments(TrainingArguments):
 
     # Auto saving when interrupted
     save_on_interrupt: bool = False # save model when interrupted (useful for long training)
+    
+    # forward_delta
+    apply_forward_delta: bool = field(
+        default=False,
+        metadata={"help":"Use all difflayer in diff_fake_quant_mx.py"}
+    )
+    
+    trainable_mode: str = field(
+        default="all",
+        metadata={"help": "Trainable params: all | linear_only (freeze embedding & layernorm)"}
+    )
+    
+    # Quantization 
+    mx_w_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for weight"}
+    )
+    
+    mx_a_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for activation"}
+    )
+    
+    mx_diffw_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for diff_weight in QdiffLinear"}
+    )
+    
+    mx_diffa_elem_format : str = field(
+        default=None,
+        metadata={"help": "choose your mx quantize format for diff_input in QdiffLinear"}
+    )
+    
+    enable_x: bool = field(
+        default=False,
+        metadata={"help": "quantize activation_odd"}
+    )
+    
+    enable_diffx: bool = field(
+        default=False,
+        metadata={"help": "quantize diff_activation"}
+    )
+    
+    enable_w: bool = field(
+        default=False,
+        metadata={"help": "quantize weight_even"}
+    )
+    
+    enable_diffw: bool = field(
+        default=False,
+        metadata={"help": "quantize diff_weight"}
+    )
+    
 
 
 def parse_args():
@@ -121,8 +177,8 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
+    
+    
 class Framework:
 
     def __init__(self, args, task):
@@ -144,14 +200,18 @@ class Framework:
                 config.tie_word_embeddings = False
             if self.args.head_tuning:
                 # Head tuning
-                from ht_opt import OPTForCausalLM
-                model = OPTForCausalLM.from_pretrained(
+                from ht_opt import OPTForCausalLM as HT_OPTForCausalLM
+                model = HT_OPTForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
                 )
             elif self.args.no_auto_device:
                 # No auto device (use for FSDP)
-                model = AutoModelForCausalLM.from_pretrained(
+                # model = AutoModelForCausalLM.from_pretrained(
+                #     self.args.model_name if self.args.model_path is None else self.args.model_path,
+                #     config=config,
+                # )
+                model = OPTForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
                 )
@@ -162,7 +222,15 @@ class Framework:
                     torch_dtype = torch.float16
                 elif self.args.load_bfloat16:
                     torch_dtype = torch.bfloat16
-                model = AutoModelForCausalLM.from_pretrained(
+                # model = AutoModelForCausalLM.from_pretrained(
+                #     self.args.model_name if self.args.model_path is None else self.args.model_path,
+                #     config=config,
+                #     device_map='auto',
+                #     torch_dtype=torch_dtype,
+                #     max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
+                #     load_in_8bit=self.args.load_int8,
+                # )
+                model = OPTForCausalLM.from_pretrained(
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
                     device_map='auto',
@@ -171,6 +239,7 @@ class Framework:
                     load_in_8bit=self.args.load_int8,
                 )
             model.eval()
+            print(model)
 
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.args.model_name if self.args.model_path is None else self.args.model_path, use_fast=False)
@@ -408,6 +477,7 @@ class Framework:
             collator = DataCollatorForTokenClassification
 
         if self.args.trainer == "LOZO":
+            print("tariner is LOZO")
             trainer = LowRankTrainer(
                 model=self.model, 
                 args=self.args,
@@ -418,6 +488,33 @@ class Framework:
             )
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
+            
+        # Check: if weight tying?
+        # w1 = self.model.model.decoder.embed_tokens.weight
+        # w2 = self.model.lm_head.weight
+        # print("HIHIHI")
+        # print(w1 is w2)                               # 是否同一个 Parameter 对象
+        # print(w1.data_ptr() == w2.data_ptr())         # 是否同一块显存
+
+        # Add: apply Forward_delta
+        if self.args.apply_forward_delta:
+            logger.info("replacing nnlayers in model with difflayers")
+            uv_provider = trainer.make_uv_provider()
+            z_provider = trainer.make_z_provider()
+            
+            if self.model.config.model_type == "opt":
+                QuantizeOPTForLOZO(model=self.model,
+                                       mx_w_elem_format=self.args.mx_w_elem_format, mx_a_elem_format=self.args.mx_a_elem_format, mx_diffw_elem_format=self.args.mx_diffw_elem_format, mx_diffa_elem_format=self.args.mx_diffa_elem_format, 
+                                       enable_w=self.args.enable_w, enable_x=self.args.enable_x, enable_diffx=self.args.enable_diffx, enable_diffw=self.args.enable_diffw, 
+                                       uv_provider=uv_provider, z_provider=z_provider)
+            logger.info("Replace All nnLayers with diffLayers to support forward_delta")
+            print(f"model:{self.model}") 
+        
+        # CheckAgain: if weight tying?
+        # w1 = self.model.model.decoder.embed_tokens.weight
+        # w2 = self.model.lm_head.weight
+        # print(w1 is w2)                               # 是否同一个 Parameter 对象
+        # print(w1.data_ptr() == w2.data_ptr())         # 是否同一块显存
 
         # Resume training from a last checkpoint
         last_checkpoint = None
@@ -432,7 +529,8 @@ class Framework:
         if self.args.resume_from_checkpoint is not None:
             last_checkpoint = self.args.resume_from_checkpoint
 
-        trainer.train(resume_from_checkpoint=last_checkpoint) 
+        # trainer.train(resume_from_checkpoint=last_checkpoint) 
+        trainer.train(resume_from_checkpoint=None) 
 
         # Explicitly save the model
         if self.args.save_model:

@@ -10,7 +10,7 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 source ~/.bashrc
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=7
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
@@ -23,7 +23,7 @@ BS=${BS:-64}
 LR=${LR:-1e-6}
 EPS=${EPS:-1e-3}
 WD=${WD:-0}
-STEP=${STEP:-10000}
+STEP=${STEP:-20000}
 EVAL_STEP=${EVAL_STEP:-500}
 STEP_INTERVAL=${STEP_INTERVAL:-50}
 RANK=${RANK:-8}
@@ -31,7 +31,7 @@ LOZO_OPTIMIZER=${LOZO_OPTIMIZER:-'sgd'}
 BETA1=${BETA1:-0.9}
 MODEL=${MODEL:-"/lamport/shared/hzheng/workspace/model/roberta-large"}
 MODELNAME=${MODELNAME:-"roberta-large"}
-LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"test_mx_new/mx16"}
+LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"test_mx_new/mx166"}
 
 
 # lora参数
@@ -65,9 +65,12 @@ ENABLE_DIFFX=${ENABLE_DIFFX:-true}
 ENABLE_W=${ENABLE_W:-true}
 ENABLE_DIFFW=${ENABLE_DIFFW:-true}
 MX_A_ELEM_FORMAT=${MX_A_ELEM_FORMAT:-"fp8_e4m3"}
-MX_DIFFA_ELEM_FORMAT=${MX_DIFFA_ELEM_FORMAT:-"fp4_e2m1"}
+MX_DIFFA_ELEM_FORMAT=${MX_DIFFA_ELEM_FORMAT:-"int2"}
 MX_W_ELEM_FORMAT=${MX_W_ELEM_FORMAT:-"fp4_e2m1"}
 MX_DIFFW_ELEM_FORMAT=${MX_DIFFW_ELEM_FORMAT:-"fp4_e2m1"}
+
+TRAINABLE_MODE=${TRAINABLE_MODE:-"all"}
+
 
 
 LOGITS=$(jq -n '{"SNLI": 3, "MNLI": 3, "trec": 6, "sst-5": 5}["'$TASK'"] // 2')
@@ -96,7 +99,7 @@ echo "Tag: $TAG"
 
 # 设置 ENABLE 变量 用于表征区分 quantize pattern
 if [ "$APPLY_FORWARD_DELTA" = "true" ]; then
-    ENABLE="Quantdiff"
+    ENABLE="Quantdiff-${TRAINABLE_MODE}"
 
     if [ "$ENABLE_X" = "true" ]; then
         ENABLE="${ENABLE}-x${MX_A_ELEM_FORMAT}"
@@ -111,7 +114,7 @@ if [ "$APPLY_FORWARD_DELTA" = "true" ]; then
         ENABLE="${ENABLE}-dw${MX_DIFFW_ELEM_FORMAT}"
     fi
 else
-    ENABLE="normal"
+    ENABLE="normal-${TRAINABLE_MODE}"
 fi
 
 echo "Quantize pattern: $ENABLE"
@@ -133,8 +136,10 @@ TYPE=$FEW_SHOT_TYPE GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED 
     --enable_custom_linear $ENABLE_CUSTOM_LINEAR --custom_linear_plot_dir $CUSTOM_LINEAR_PLOT_DIR --plot_interval $PLOT_INTERVAL \
     --enable_differential_linear $ENABLE_DIFFENRENTIAL_LINEAR --enable_differential_validation $ENABLE_DIFFENRENTIAL_VALIDATION --enable_accurate_diff $ENABLE_ACCURATE_DIFF --differential_plot_dir $DIFFERENTIAL_PLOT_DIR --differential_validation_file $DIFFERENTIAL_VALIDATION_FILE \
     --enable_QdiffLinear $ENABLE_QDIFFLINEAR --mx_quan $MX_QUAN --mx_w_elem_format $MX_W_ELEM_FORMAT --mx_a_elem_format $MX_A_ELEM_FORMAT --mx_diffw_elem_format $MX_DIFFW_ELEM_FORMAT --mx_diffa_elem_format $MX_DIFFA_ELEM_FORMAT --act_quant_pattern $ACT_QUANT_PATTERN --act_bit $ACT_BIT --weight_bit $WEIGHT_BIT --enable_x $ENABLE_X --enable_diffx $ENABLE_DIFFX --enable_w $ENABLE_W --enable_diffw $ENABLE_DIFFW \
-    --use_uv_diffw True \
-    --apply_forward_delta $APPLY_FORWARD_DELTA \
+    --use_uv_diffw True --trainable_mode $TRAINABLE_MODE \
+    --apply_forward_delta $APPLY_FORWARD_DELTA --use_forward_delta_loss $APPLY_FORWARD_DELTA\
     --load_best_model_at_end True --evaluation_strategy steps --save_strategy steps --save_total_limit 1 --evaluate_during_training $EVALUATE_DURING_TRAINING\
     --save_steps $EVAL_STEP \
+    --debug_forward_delta --debug_forward_delta_steps 5 --debug_forward_delta_tol 1e-6 --debug_forward_delta_abort False \
+    --compare_seed --compare_seed_steps 30 \
     $@

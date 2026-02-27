@@ -401,9 +401,9 @@ class LowRankTrainer(LinearHeadTrainer):
         self.lowrank_zo_perturb_parameters(scaling_factor=-2)
         loss2 = self.zo_forward(model, inputs)
         
-        print(f"step:{self.step}")
-        print(f"inputs:{inputs}")
-        print(f"loss1:{loss1}; loss2:{loss2}")
+        # print(f"step:{self.step}")
+        # print(f"inputs:{inputs}")
+        # print(f"loss1:{loss1}; loss2:{loss2}")
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()   # ZO估计梯度
 

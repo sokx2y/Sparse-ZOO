@@ -161,13 +161,23 @@ def model_for_prompting_forward_delta(
     sfc_attention_mask=None,
     sfc_mask_pos=None,
 ):
-    # 用 base 来算校准偏置 
+    icl_sfc_bias_base = None
+    icl_sfc_bias_pert = None
     if sfc_input_ids is not None:
         with torch.no_grad():
-            logits_sfc = model_for_prompting_forward(model,input_ids=sfc_input_ids,attention_mask=sfc_attention_mask,mask_pos=sfc_mask_pos,)[0]
-        icl_sfc_bias = F.log_softmax(logits_sfc.detach().squeeze(0))
-    else:
-        icl_sfc_bias = None
+            sfc_logits_base, sfc_logits_pert = model_for_prompting_forward_delta(
+                model,
+                input_ids=sfc_input_ids,
+                attention_mask=sfc_attention_mask,
+                token_type_ids=token_type_ids,
+                mask_pos=sfc_mask_pos,
+                labels=None,
+                sfc_input_ids=None,
+                sfc_attention_mask=None,
+                sfc_mask_pos=None,
+            )
+        icl_sfc_bias_base = F.log_softmax(sfc_logits_base.detach().squeeze(0), dim=-1)
+        icl_sfc_bias_pert = F.log_softmax(sfc_logits_pert.detach().squeeze(0), dim=-1)
 
     if mask_pos is not None:
         mask_pos = mask_pos.squeeze()
@@ -298,9 +308,9 @@ def model_for_prompting_forward_delta(
     if model.model_args.sfc and hasattr(model, "sfc_bias"):
         logits_base = F.log_softmax(logits_base, -1) - model.sfc_bias
         logits_pert = F.log_softmax(logits_pert, -1) - model.sfc_bias
-    if icl_sfc_bias is not None:
-        logits_base = F.log_softmax(logits_base, -1) - icl_sfc_bias
-        logits_pert = F.log_softmax(logits_pert, -1) - icl_sfc_bias
+    if icl_sfc_bias_base is not None:
+        logits_base = F.log_softmax(logits_base, -1) - icl_sfc_bias_base
+        logits_pert = F.log_softmax(logits_pert, -1) - icl_sfc_bias_pert
 
     if model.model_args.use_task_word and model.num_labels == 1:
         logits_base = torch.exp(logits_base[..., 1].unsqueeze(-1)) * (model.ub - model.lb) + model.lb
@@ -359,11 +369,7 @@ class RobertaModelForPromptFinetuning(RobertaPreTrainedModel):
         self.model_type = config.model_type
         self.roberta = RobertaModel(config)
         self.lm_head = RobertaLMHead(config)
-        use_diff = getattr(config, "apply_forward_delta", False)
-        if use_diff:
-            self.classifier = diffLinear(layer_name = "classifier", in_features = config.hidden_size, out_features = self.num_labels, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider)
-        else:
-            self.classifier = nn.Linear(config.hidden_size, self.num_labels)
+        self.classifier = nn.Linear(config.hidden_size, self.num_labels)
 
         self.init_weights()
 

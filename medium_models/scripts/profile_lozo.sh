@@ -55,14 +55,14 @@ APPLY_FORWARD_DELTA=true
 rm data/k-shot-1k-test/SST-2/16-42/cached_*
 
 # 基本任务配置
-TASK=SST-2
-K=16
+TASK=SNLI
+K=512
 SEED=42
 BS=64
-LR=1e-7
+LR=1e-6
 EPS=1e-3
 MODEL=/lamport/shared/hzheng/workspace/model/roberta-large
-RANK=4
+RANK=8
 STEP_INTERVAL=10
 STEP=50 # keep the step small for only profiling
 

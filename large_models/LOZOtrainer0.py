@@ -211,11 +211,6 @@ SCALER_NAME = "scaler.pt"
 
 
 class LowRankTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.u = {} 
-        self.z = {}
-        self.debug_forward_delta = True
 
     from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
 
@@ -407,8 +402,7 @@ class LowRankTrainer(Trainer):
         logger.info(
             f"  Number of trainable parameters = {sum(p.numel() for p in model.parameters() if p.requires_grad)}"
         )
-        
-        
+
         self.state.epoch = 0
         start_time = time.time()
         epochs_trained = 0
@@ -719,66 +713,12 @@ class LowRankTrainer(Trainer):
                 else:
                     v = self.v[name]
                 u = self.random_gaussian_matrix(m=param.data.size(0), n=args.rank_r, device=param.data.device, dtype=param.data.dtype)
-                # new2: cached u (low-rank matrix memory cost)
-                self.u[name] = u
                 param.data = param.data + scaling_factor * (u@v.t()) * self.args.zo_eps
             else:
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
-                self.z[name] = z
                 param.data = param.data + scaling_factor * z * self.args.zo_eps
-    
-    def make_z_provider(self):
-        """
-        provide z to replace diff_bias and diff_weight in layernorm
-        """
-        def provider(param_name, shape, device, dtype, inference_count):
-            z = None
-            if hasattr(self, "z"):
-                z = self.z.get(param_name, None)
-            if z is None:
-                z = torch.normal(mean=0.0, std=1.0, size=shape, device=device, dtype=dtype)
-            scale = -2 * self.args.zo_eps
-            return z, scale
-            # return z, 0
-        
-        return provider
-    
-    def make_uv_provider(self):
-        """
-        provide u,v^t to replace diff_weight in our quantize method(QdiffLinear).
-        """
-        def provider(param_name, shape, device, dtype, inference_count):
-            out_f, in_f = shape
-            # provide v from cache
-            v = None
-            if hasattr(self, "v"):
-                v = self.v.get(param_name, None)
-            if v is None: 
-                v = torch.randn(in_f, self.args.rank_r, device=device, dtype=dtype)
-                
-            # But failed: provide u from regeneration(cache seed_u)
-            # if param_name in self.u_seeds:
-                # u_seed = self.u_seeds[param_name]
-                # u = self.random_gaussian_matrix(m=out_f, n=self.args.rank, device=device, dtype=dtype, random_seed=u_seed)
-            # else:
-                # print(f"Error: no u_seeds cache to regeneration!")
-            
-            # use cache_u directly
-            u = None
-            if hasattr(self, "u"):
-                u = self.u.get(param_name, None)
-            if u is None: 
-                u = torch.randn(out_f, self.args.rank_r, device=device, dtype=dtype)
-            
-            # The difference between the even iteration and the odd cached weights is −2×zo_eps×(UVT).
-            scale = -2 * self.args.zo_eps
-            return u, v, scale
-            # return u, v, 0
 
-        return provider
-    
-    
-    def zo_forward(self, model, inputs, with_delta = False):
+    def zo_forward(self, model, inputs):
         """
         Get (no gradient) loss from the model. Dropout is turned off too.
         """
@@ -789,39 +729,12 @@ class LowRankTrainer(Trainer):
 
         with torch.inference_mode():
             inputs = self._prepare_inputs(inputs)
-            inputs["return_dict"] = False
             with self.compute_loss_context_manager():
-                if with_delta:
-                    if not hasattr(model, "forward_delta"):
-                        raise AttributeError(
-                            "model 没有 forward_delta 方法，请为 model 添加此路径"
-                        )
-                    outputs = model.forward_delta(**inputs)
-
-                    if not isinstance(outputs, (tuple, list)) or len(outputs) < 2:
-                        raise ValueError(
-                            "期望 model.forward_delta 返回 (loss_base, loss_perturbed, ...)，"
-                            f"但实际得到类型/长度为: {type(outputs)}, len={len(outputs) if isinstance(outputs, (tuple, list)) else 'N/A'}"
-                        )
-                    loss_base, loss_perturbed = outputs[0], outputs[1]
-                    print(f"[CHECK] base={loss_base.item():.6f} pert={loss_perturbed.item():.6f} "
-                          f"abs={(loss_base-loss_perturbed).abs().item():.6f}", flush=True)
-
-                else:
-                    loss = self.compute_loss(model, inputs)
-                    
+                loss = self.compute_loss(model, inputs)
             if self.args.n_gpu > 1:
                 # Warning: this is copied from the original Huggingface Trainer. Untested.
-                if with_delta:
-                    loss_base = loss_base.mean()
-                    loss_perturbed = loss_perturbed.mean()
-                else:
-                    loss = loss.mean()
-                    
-        if with_delta:
-            return loss_base.detach(), loss_perturbed.detach()
-        else:
-            return loss.detach()
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+        return loss.detach()
 
 
     def zo_forward_nondiff(self, model, inputs):
@@ -865,40 +778,14 @@ class LowRankTrainer(Trainer):
 
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
-        
-        
-        # debug!!!
-        if self.debug_forward_delta and self.step < 3:
-            self.lowrank_zo_perturb_parameters(scaling_factor=1)
-            loss_plus = self.zo_forward(model, inputs, with_delta=False)  
-            self.lowrank_zo_perturb_parameters(scaling_factor=-2)
-            loss_minus = self.zo_forward(model, inputs, with_delta=False) 
-            self.lowrank_zo_perturb_parameters(scaling_factor=2)
-            loss_base, loss_pert = self.zo_forward(model, inputs, with_delta=True)
-        
-            print("[DEBUG] loss_plus(old)  =", float(loss_plus))
-            print("[DEBUG] loss_base(new)  =", float(loss_base))
-            print("[DEBUG] abs diff (+)    =", float((loss_plus - loss_base).abs()))
-            print("[DEBUG] loss_minus(old) =", float(loss_minus))
-            print("[DEBUG] loss_pert(new)  =", float(loss_pert))
-            print("[DEBUG] abs diff (-)    =", float((loss_minus - loss_pert).abs()))
-        
-            g_old = ((loss_plus - loss_minus) / (2 * self.args.zo_eps)).item()
-            g_new = ((loss_base - loss_pert) / (2 * self.args.zo_eps)).item()
-            print("[DEBUG] proj_grad old =", g_old)
-            print("[DEBUG] proj_grad new =", g_new)
-            print("[DEBUG] grad abs diff =", abs(g_old - g_new))
-            
-            self.lowrank_zo_perturb_parameters(scaling_factor=-1)
 
         # First function evaluation
         self.lowrank_zo_perturb_parameters(scaling_factor=1)
-        loss1, loss2 = self.zo_forward(model, inputs, with_delta = True)
-        
+        loss1 = self.zo_forward(model, inputs)
 
         # Second function evaluation
-        # self.lowrank_zo_perturb_parameters(scaling_factor=-2)
-        # loss2 = self.zo_forward(model, inputs)
+        self.lowrank_zo_perturb_parameters(scaling_factor=-2)
+        loss2 = self.zo_forward(model, inputs)
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
 
@@ -906,7 +793,7 @@ class LowRankTrainer(Trainer):
         assert self.args.gradient_accumulation_steps == 1
 
         # Reset model back to its parameters at start of step
-        self.lowrank_zo_perturb_parameters(scaling_factor=-1)
+        self.lowrank_zo_perturb_parameters(scaling_factor=1)
         return loss1
 
 

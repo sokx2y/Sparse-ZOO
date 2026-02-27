@@ -7,4 +7,14 @@
 
 medium_models/data/*
 medium_models/result/*
-medium_models/custom_linear_plots/*
+medium_models/custom_linear_plots/*# experiment outputs / checkpoints
+large_models/result/
+medium_models/result/
+**/checkpoint-*/
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.log
+wandb/
+runs/

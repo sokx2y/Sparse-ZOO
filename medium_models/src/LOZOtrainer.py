@@ -386,7 +386,67 @@ class LowRankTrainer(LinearHeadTrainer):
             return u, v, scale
 
         return provider
-            
+    
+    def _should_probe(self, gs: int) -> bool:
+        args = self.args
+        if not getattr(args, "compare_seed", False):
+            return False
+        first_k = int(getattr(args, "compare_seed_steps", 0))
+        if gs < first_k:
+            return True
+        # Probe around evaluation boundary
+        if getattr(args, "evaluate_during_training", False):
+            E = int(getattr(args, "eval_steps", 0))
+            if E > 0:
+                r = gs % E
+                if r == 0 or r == 1 or r == (E - 1):
+                    return True
+        return False
+
+    @staticmethod
+    def _fp_tensor(t):
+        import hashlib
+        b = t.detach().cpu().numpy().tobytes()
+        return hashlib.md5(b).hexdigest()[:8]
+    
+    def _debug_forward_delta_sanity_check(
+        self,
+        *,
+        loss_plus_true: torch.Tensor,
+        loss_minus_true: torch.Tensor,
+        loss_plus_fd: torch.Tensor,
+        loss_minus_fd: torch.Tensor,
+    ) -> None:
+        """Compare true +/- losses (two normal forwards) vs forward_delta returned losses."""
+        tol = float(getattr(self.args, "debug_forward_delta_tol", 1e-6))
+        abort = bool(getattr(self.args, "debug_forward_delta_abort", True))
+
+        lp_t = float(loss_plus_true.detach().cpu())
+        lm_t = float(loss_minus_true.detach().cpu())
+        lp_f = float(loss_plus_fd.detach().cpu())
+        lm_f = float(loss_minus_fd.detach().cpu())
+
+        d_plus = abs(lp_t - lp_f)
+        d_minus = abs(lm_t - lm_f)
+
+        logger.info(
+            "[debug_forward_delta] step=%s | plus_true=%.10f plus_fd=%.10f (abs diff=%.3e) | "
+            "minus_true=%.10f minus_fd=%.10f (abs diff=%.3e)",
+            getattr(self, "step", "?"),
+            lp_t, lp_f, d_plus,
+            lm_t, lm_f, d_minus,
+        )
+
+        if (d_plus > tol) or (d_minus > tol):
+            msg = (
+                f"[debug_forward_delta] FAILED step={getattr(self,'step','?')} tol={tol} | "
+                f"plus_true={lp_t} plus_fd={lp_f} (abs diff={d_plus}) | "
+                f"minus_true={lm_t} minus_fd={lm_f} (abs diff={d_minus})"
+            )
+            if abort:
+                raise RuntimeError(msg)
+            else:
+                logger.warning(msg)
 
     def lowrank_zo_step(self, model, inputs):   # 通过loss来用ZO方法估计梯度
         """
@@ -409,12 +469,82 @@ class LowRankTrainer(LinearHeadTrainer):
 
         # Sample the random seed for sampling z
         self.zo_random_seed = np.random.randint(1000000000)
+        
+        # Debugging: log seed for comparison
+        gs = int(getattr(self.state, "global_step", self.step))
+        do_probe = self._should_probe(gs)
+        mode_str = "fd" if getattr(args, "use_forward_delta_loss", True) else "base"
+        if do_probe:
+            logger.info("[seed_cmp] mode=%s step=%d zo_random_seed=%d",
+                        "fd" if getattr(args, "use_forward_delta_loss", True) else "base",
+                        self.step, self.zo_random_seed)
+
 
         # First function evaluation
         # and only one inference is enough, one inference, two loss
         self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        
+        # Debugging: compare seed and uvz
+        if do_probe:
+            p2d = getattr(args, "compare_seed_param", "")
+            p1d = getattr(args, "compare_seed_param_1d", "")
+        
+            # 2D u/v
+            if hasattr(self, "u") and hasattr(self, "v") and (p2d in self.u) and (p2d in self.v):
+                u = self.u[p2d]; v = self.v[p2d]
+                logger.info("[uv_fp] mode=%s step=%d %s u_md5=%s v_md5=%s u_norm=%.6f v_norm=%.6f u00=%.6f v00=%.6f",
+                            "fd" if getattr(args, "use_forward_delta_loss", True) else "base",
+                            self.step, p2d,
+                            self._fp_tensor(u), self._fp_tensor(v),
+                            u.norm().item(), v.norm().item(),
+                            u.flatten()[0].item(), v.flatten()[0].item())
+            else:
+                # 如果 NOT_FOUND，大概率是 compare_seed_param 的名字和你 model.named_parameters() 的真实名字不一致
+                keys = list(self.u.keys())[:5] if hasattr(self, "u") else []
+                logger.info("[uv_fp] mode=%s step=%d %s NOT_FOUND; example_keys=%s",
+                            "fd" if getattr(args, "use_forward_delta_loss", True) else "base",
+                            self.step, p2d, keys)
+        
+            # 1D z
+            if hasattr(self, "z") and (p1d in self.z):
+                z = self.z[p1d]
+                logger.info("[z_fp] mode=%s step=%d %s z_md5=%s z_norm=%.6f z0=%.6f",
+                            "fd" if getattr(args, "use_forward_delta_loss", True) else "base",
+                            self.step, p1d,
+                            self._fp_tensor(z), z.norm().item(), z.flatten()[0].item())
+            else:
+                keys = list(self.z.keys())[:5] if hasattr(self, "z") else []
+                logger.info("[z_fp] mode=%s step=%d %s NOT_FOUND; example_keys=%s",
+                            "fd" if getattr(args, "use_forward_delta_loss", True) else "base",
+                            self.step, p1d, keys)
+                
+        # Debugging: forward_delta sanity-check
+        gs = int(getattr(self.state, "global_step", self.step))
+        do_probe = self._should_probe(gs)
+        
+        do_debug = bool(getattr(args, "debug_forward_delta", False)) and (
+            gs < int(getattr(args, "debug_forward_delta_steps", 0)) or do_probe
+        )
+
+        if do_debug and (not getattr(args, "use_forward_delta_loss", True)):
+            logger.warning("[debug_forward_delta] enabled but use_forward_delta_loss=False (base mode). "
+                           "Sanity-check is intended for forward_delta mode, skipping.")
+        loss_plus_true = None
+        if do_debug and getattr(args, "use_forward_delta_loss", True):
+            # true loss at theta + eps*delta using normal forward
+            loss_plus_true = self.zo_forward(model, inputs, with_delta=False)
+
+
         # loss1 = self.zo_forward(model, inputs)
-        loss1, loss2 = self.zo_forward(model, inputs, with_delta = True)
+        if getattr(args, "use_forward_delta_loss", True):
+            # one inference -> two losses
+            loss1, loss2 = self.zo_forward(model, inputs, with_delta=True)
+        else:
+            # two normal forwards
+            loss1 = self.zo_forward(model, inputs, with_delta=False)
+            self.lowrank_zo_perturb_parameters(scaling_factor=-2)  # now at -eps
+            loss2 = self.zo_forward(model, inputs, with_delta=False)
+            self.lowrank_zo_perturb_parameters(scaling_factor=2)   # restore to +eps
         
         # print(f"step:{self.step}")
         # print(f"inputs:{inputs}")
@@ -426,6 +556,33 @@ class LowRankTrainer(LinearHeadTrainer):
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()   # ZO估计梯度
 
+        #Debugging: sanity-check forward_delta vs true +/- (and gradient diff)
+        if do_debug and getattr(args, "use_forward_delta_loss", True):
+            eps = float(self.args.zo_eps)
+
+            # true loss at theta - eps*delta (by moving parameters to -eps)
+            self.lowrank_zo_perturb_parameters(scaling_factor=-2)  # now at -eps
+            loss_minus_true = self.zo_forward(model, inputs, with_delta=False)
+            self.lowrank_zo_perturb_parameters(scaling_factor=2)   # restore to +eps
+
+            # compare losses
+            self._debug_forward_delta_sanity_check(
+                loss_plus_true=loss_plus_true,
+                loss_minus_true=loss_minus_true,
+                loss_plus_fd=loss1,
+                loss_minus_fd=loss2,
+            )
+
+            # compare gradient estimate (what actually drives update)
+            g_true = float(((loss_plus_true - loss_minus_true) / (2.0 * eps)).detach().cpu())
+            g_fd = float(((loss1 - loss2) / (2.0 * eps)).detach().cpu())
+            abs_g = abs(g_true - g_fd)
+            rel_g = abs_g / (abs(g_true) + 1e-12)
+            logger.info(
+                "[debug_forward_delta][grad] step=%s | g_true=%.10e g_fd=%.10e | abs=%.3e rel=%.3e | eps=%.3e",
+                getattr(self, "step", "?"),
+                g_true, g_fd, abs_g, rel_g, eps
+            )
         # No gradient accumulation support
         assert self.args.gradient_accumulation_steps == 1
 
@@ -594,7 +751,7 @@ class LowRankTrainer(LinearHeadTrainer):
                 find_unused_parameters=True,
             )
         
-        batch = next(iter(train_dataloader))
+        # batch = next(iter(train_dataloader))
         # self.debug_check_forward_delta_alignment_one_batch(model, batch)
 
         # Train
@@ -765,6 +922,10 @@ class LowRankTrainer(LinearHeadTrainer):
                 if self.args.evaluate_during_training and self.state.global_step % self.args.eval_steps == 0:
                     output = self.evaluate()
                     metrics = output.metrics
+                    
+                    mode_str = "fd" if getattr(self.args, "use_forward_delta_loss", True) else "base"
+                    logger.info("[eval_record] mode=%s gs=%d metrics=%s", mode_str, self.state.global_step, metrics)
+
                     objective = self.dev_objective(metrics)
                     if objective > self.objective:
                         logger.info("Best dev result: {}".format(objective))

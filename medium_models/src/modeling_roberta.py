@@ -172,18 +172,6 @@ class RobertaConfig(BertConfig):
         self.lora_r = lora_r 
         self.lora_alpha = lora_alpha
         
-        # forward_delta
-        self.apply_forward_delta = apply_forward_delta
-        self.uv_provider = uv_provider
-        self.z_provider = z_provider
-        self.enable_x = enable_x
-        self.enable_diffx = enable_diffx
-        self.enable_w = enable_w
-        self.enable_diffw = enable_diffw
-        self.mx_w_elem_format = mx_w_elem_format
-        self.mx_a_elem_format = mx_a_elem_format
-        self.mx_diffw_elem_format = mx_diffw_elem_format
-        self.mx_diffa_elem_format = mx_diffa_elem_format
         
 
 class RobertaEmbeddings(nn.Module):
@@ -194,29 +182,13 @@ class RobertaEmbeddings(nn.Module):
     # Copied from transformers.models.bert.modeling_bert.BertEmbeddings.__init__
     def __init__(self, config):
         super().__init__()
-        if getattr(config, "apply_forward_delta", False):
-            self.word_embeddings = diffEmbedding(num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, padding_idx=config.pad_token_id, layer_name='roberta.embeddings.word_embeddings', uv_provider=config.uv_provider)
-        else:
-            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        
-        self.padding_idx = config.pad_token_id
-        if getattr(config, "apply_forward_delta", False):
-            self.position_embeddings = diffEmbedding(num_embeddings=config.max_position_embeddings, embedding_dim=config.hidden_size, padding_idx=config.pad_token_id, layer_name='roberta.embeddings.position_embeddings', uv_provider=config.uv_provider)
-        else:
-            self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size, padding_idx=config.pad_token_id)
-        
-        if getattr(config, "apply_forward_delta", False):
-            self.token_type_embeddings = diffEmbedding(num_embeddings=config.type_vocab_size, embedding_dim=config.hidden_size, layer_name='roberta.embeddings.token_type_embeddings', uv_provider=config.uv_provider)
-        else:
-            self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
-        if getattr(config, "apply_forward_delta", False):
-            self.LayerNorm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name="roberta.embeddings.LayerNorm", z_provider=config.z_provider)
-        else:
-            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -226,10 +198,10 @@ class RobertaEmbeddings(nn.Module):
         )
 
         # End copy
-        # self.padding_idx = config.pad_token_id
-        # self.position_embeddings = nn.Embedding(
-            # config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
-        # )
+        self.padding_idx = config.pad_token_id
+        self.position_embeddings = nn.Embedding(
+            config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
+        )
 
     def forward(
         self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
@@ -274,6 +246,11 @@ class RobertaEmbeddings(nn.Module):
     def forward_delta(
         self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None, past_key_values_length=0
     ):
+        assert hasattr(self.word_embeddings, "forward_delta"), "word_embeddings not replaced to diffEmbedding"
+        assert hasattr(self.position_embeddings, "forward_delta"), "position_embeddings not replaced to diffEmbedding"
+        assert hasattr(self.token_type_embeddings, "forward_delta"), "token_type_embeddings not replaced to diffEmbedding"
+        assert hasattr(self.LayerNorm, "forward_delta"), "LayerNorm not replaced to diffLayerNorm"
+
         if position_ids is None:
             if input_ids is not None:
                 # Create the position ids from the input token ids. Any padded tokens remain padded.
@@ -357,40 +334,15 @@ class RobertaSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-        
-        use_diff = getattr(config, "apply_forward_delta", False)
-        prefix = f"roberta.encoder.layer.{layer_idx}.attention.self"
-        
-        # query
-        if use_diff:
-            self.query = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
-                                     layer_name = f"{prefix}.query", 
-                                     in_features = config.hidden_size, out_features = self.all_head_size, bias=True,
-                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
-                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        elif getattr(config, "apply_lora", False):
+
+        if getattr(config, "apply_lora", False):
             self.query = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
         else:
             self.query = nn.Linear(config.hidden_size, self.all_head_size)
         
-        # key
-        if use_diff:
-            self.key = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
-                                     layer_name = f"{prefix}.key", 
-                                     in_features = config.hidden_size, out_features = self.all_head_size, bias=True,
-                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
-                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        else:
-            self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        
-        # value
-        if use_diff:
-            self.value = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
-                                     layer_name = f"{prefix}.value", 
-                                     in_features = config.hidden_size, out_features = self.all_head_size, bias=True,
-                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
-                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        elif getattr(config, "apply_lora", False):
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+
+        if getattr(config, "apply_lora", False):
             self.value = lora.Linear(config.hidden_size, self.all_head_size, config.lora_r, lora_alpha=config.lora_alpha)
         else:
             self.value = nn.Linear(config.hidden_size, self.all_head_size)
@@ -677,23 +629,10 @@ class RobertaSelfAttention(nn.Module):
 class RobertaSelfOutput(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        use_diff = getattr(config, "apply_forward_delta", False)
-        prefix = f"roberta.encoder.layer.{layer_idx}.attention.output"
-        if use_diff:
-            self.dense = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
-                                     layer_name = f"{prefix}.dense", 
-                                     in_features = config.hidden_size, out_features = config.hidden_size, bias=True,
-                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
-                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        else:
-            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        if use_diff:
-            self.LayerNorm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name=f"{prefix}.LayerNorm", z_provider=config.z_provider)
-        else:
-            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
+        
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
@@ -806,6 +745,8 @@ class RobertaAttention(nn.Module):
         output_attentions: Optional[bool] = False,
         output_key_value: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
+        assert encoder_hidden_states is None and past_key_value is None
+        assert not output_key_value
         self_outputs = self.self.forward_delta(
             hidden_states = hidden_states,
             diff_hidden_states = diff_hidden_states,
@@ -832,17 +773,7 @@ class RobertaAttention(nn.Module):
 class RobertaIntermediate(nn.Module):
     def __init__(self, config,layer_idx):
         super().__init__()
-        use_diff = getattr(config, "apply_forward_delta", False)
-        prefix = f"roberta.encoder.layer.{layer_idx}.intermediate"
-        if use_diff:
-            self.dense = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
-                                     layer_name = f"{prefix}.dense", 
-                                     in_features = config.hidden_size, out_features = config.intermediate_size, bias=True,
-                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
-                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        else:
-            self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-            
+        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
@@ -878,20 +809,8 @@ class RobertaIntermediate(nn.Module):
 class RobertaOutput(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        use_diff =  getattr(config, "apply_forward_delta", False)
-        prefix = f"roberta.encoder.layer.{layer_idx}.output"
-        if use_diff:
-            self.dense = QdiffLinear(enable_x = config.enable_x, enable_diffx = config.enable_diffx, enable_w = config.enable_w, enable_diffw = config.enable_diffw,
-                                     layer_name = f"{prefix}.dense", 
-                                     in_features = config.intermediate_size, out_features = config.hidden_size, bias=True,
-                                     mx_w_elem_format=config.mx_w_elem_format, mx_a_elem_format=config.mx_a_elem_format, mx_diffw_elem_format=config.mx_diffw_elem_format, mx_diffa_elem_format=config.mx_diffa_elem_format,
-                                     uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        else:
-            self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        if use_diff:
-            self.LayerNorm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name=f"{prefix}.LayerNorm", z_provider=config.z_provider)
-        else:
-            self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -1047,6 +966,8 @@ class RobertaLayer(nn.Module):
           - encoder 自注意力（RoBERTa 标准用法）
           - 不支持 cross-attention / decoder / use_cache
         """
+        if output_key_value:
+            raise NotImplementedError("forward_delta does not support output_key_value/use_cache")
         if (self.is_decoder or self.add_cross_attention or encoder_hidden_states is not None or past_key_value is not None):
             raise NotImplementedError(
                 "RobertaLayer.forward_delta currently only supports encoder self-attention "
@@ -1072,6 +993,7 @@ class RobertaLayer(nn.Module):
         # FFN（intermediate + output）的 delta
         # 这里不再做 chunking，直接一次性算完整序列；
         # 标准路径 RoBERTa 默认 chunk_size_feed_forward=0，本来就不 chunk
+        assert self.chunk_size_feed_forward == 0, "forward_delta currently assumes no FFN chunking"
         intermediate_output, diff_intermediate_output = self.intermediate.forward_delta(
             attention_output,
             diff_attention_output,
@@ -1345,11 +1267,7 @@ class RobertaEncoder(nn.Module):
 class RobertaPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        use_diff =  getattr(config, "apply_forward_delta", False)
-        if use_diff:
-            self.dense = diffLinear(layer_name = "roberta.pooler.dense", in_features = config.hidden_size, out_features = config.hidden_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        else:
-            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1712,7 +1630,7 @@ class RobertaModel(RobertaPreTrainedModel):
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
             raise NotImplementedError("forward_delta does not support inputs_embeds; pass input_ids instead.")
-            input_shape = inputs_embeds.size()[:-1]
+            # input_shape = inputs_embeds.size()[:-1]
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
@@ -2294,23 +2212,12 @@ class RobertaLMHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        use_diff = getattr(config, "apply_forward_delta", False)
-        if use_diff:
-            self.dense = diffLinear(layer_name = "lm_head.dense", in_features = config.hidden_size, out_features = config.hidden_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider,)
-        else:
-            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        if use_diff:
-            self.layer_norm = diffLayerNorm(config.hidden_size, eps=config.layer_norm_eps, layer_name="lm_head.layer_norm", z_provider=config.z_provider)
-        else:
-            self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if use_diff:
-            self.decoder = diffLinear(layer_name = "lm_head.decoder", in_features = config.hidden_size, out_features = config.vocab_size, bias =True, uv_provider=config.uv_provider, z_provider=config.z_provider)
-        else:
-            self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
-        
-        # self.bias = nn.Parameter(torch.zeros(config.vocab_size))
-        # self.decoder.bias = self.bias
-        self.bias = self.decoder.bias
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size)
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+        self.decoder.bias = self.bias
 
     def forward(self, features, **kwargs):
         x = self.dense(features)
@@ -2332,12 +2239,12 @@ class RobertaLMHead(nn.Module):
                     f"{self.__class__.__name__}.{name} has no forward_delta. "
                     f"Expected diff modules when apply_forward_delta=True. type={type(m)}"
                 )
-
         x, diff_x = self.dense.forward_delta(features, diff_features)
         x_pert = x + diff_x 
         x = gelu(x)
         x_pert = gelu(x_pert)
-        l, diffl = self.layer_norm.forward_delta(x, x_pert-x)
+        diff_after_gelu = x_pert - x
+        l, diffl = self.layer_norm.forward_delta(x, diff_after_gelu)
         l, diffl = self.decoder.forward_delta(l, diffl)
     
         return l, diffl

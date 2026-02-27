@@ -36,6 +36,61 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+def apply_trainable_mode(model, mode: str, logger=None):
+    if mode is None or mode.lower() == "all":
+        if logger: logger.info("[trainable_mode] all params (default).")
+        return
+
+    mode = mode.lower()
+    if mode != "linear_only":
+        raise ValueError(f"Unknown trainable_mode: {mode}")
+
+    # 0) 先全冻结
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    # 1) 处理 OPT 常见的 tied embeddings（lm_head.weight 与 embed_tokens.weight 共享）
+    in_emb = getattr(model, "get_input_embeddings", lambda: None)()
+    out_emb = getattr(model, "get_output_embeddings", lambda: None)()
+    tied_weight = None
+    if in_emb is not None and hasattr(in_emb, "weight"):
+        tied_weight = in_emb.weight  # 你要求 embedding 不动 -> 这个 weight 必须保持冻结
+
+    tied = (
+        tied_weight is not None
+        and out_emb is not None
+        and hasattr(out_emb, "weight")
+        and (out_emb.weight is tied_weight)
+    )
+    if tied and logger:
+        logger.warning(
+            "[trainable_mode] Detected tied input/output embeddings. "
+            "To keep embeddings frozen, lm_head.weight will also be frozen unless you set --untie_emb."
+        )
+
+    # 2) 只解冻“线性层类”的 weight/bias
+    for m in model.modules():
+        cls = m.__class__.__name__.lower()
+        if ("embedding" in cls) or ("layernorm" in cls) or ("layer_norm" in cls):
+            continue
+
+        w = getattr(m, "weight", None)
+        if isinstance(w, torch.nn.Parameter) and w.ndim == 2:
+            # 如果是 tied embedding 的那块 weight，跳过（否则会把 embedding 也解冻）
+            if tied_weight is not None and w is tied_weight:
+                continue
+            w.requires_grad_(True)
+
+            b = getattr(m, "bias", None)
+            if isinstance(b, torch.nn.Parameter):
+                b.requires_grad_(True)
+
+    # 3) 打印确认
+    trainable = [(n, p.numel()) for n, p in model.named_parameters() if p.requires_grad]
+    total = sum(p.numel() for p in model.parameters())
+    trainable_total = sum(x[1] for x in trainable)
+    if logger:
+        logger.info(f"[trainable_mode] linear_only trainable params: {trainable_total}/{total} ({trainable_total/total:.2%})")
 
 @dataclass
 class ModelArguments:
@@ -330,6 +385,8 @@ class DynamicDataTrainingArguments(DataTrainingArguments):
         metadata={"help": "use uv from lozotrainer to replace diff_weight during qunatization"}
     )
     
+    
+    
 
 
     # For max length
@@ -419,6 +476,48 @@ class DynamicTrainingArguments(TrainingArguments):
         default='sgd',
         metadata={"help": "optimizer selection"}
     )
+    trainable_mode: str = field(
+        default="all",
+        metadata={"help": "Trainable params: all | linear_only (freeze embedding & layernorm)"}
+    )
+    
+    # forward_delta Debugging 
+    use_forward_delta_loss: bool = field(
+        default=True,
+        metadata={"help": "If True, compute (loss+, loss-) via forward_delta (one inference). If False, use two normal forwards."}
+    )
+    # Debug4Seed
+    compare_seed: bool = field(default=False, metadata={"help": "Log zo_random_seed and u/v/z fingerprints for comparison."})
+    compare_seed_steps: int = field(default=30, metadata={"help": "Log first N steps."})
+    compare_seed_param: str = field(
+        default="roberta.encoder.layer.20.attention.self.query.weight",
+        metadata={"help": "Which parameter name to fingerprint u/v for (must be a 2D weight)."}
+    )
+    compare_seed_param_1d: str = field(
+        default="roberta.encoder.layer.20.attention.self.query.bias",
+        metadata={"help": "Which 1D parameter name to fingerprint z for."}
+    )
+
+    debug_forward_delta: bool = field(
+        default=False,
+        metadata={
+            "help": "Sanity-check forward_delta by comparing: (a) true loss at theta+eps*delta via normal forward, "
+                    "(b) loss_base returned by forward_delta, (c) true loss at theta-eps*delta via normal forward, "
+                    "and (d) loss_perturbed returned by forward_delta."
+        },
+    )
+    debug_forward_delta_steps: int = field(
+        default=1,
+        metadata={"help": "Run forward_delta sanity-check for the first N LOZO steps."},
+    )
+    debug_forward_delta_tol: float = field(
+        default=1e-6,
+        metadata={"help": "Absolute tolerance for forward_delta sanity-check (loss mismatch)."},
+    )
+    debug_forward_delta_abort: bool = field(
+        default=True,
+        metadata={"help": "If True, raise an error when sanity-check mismatch exceeds tol."},
+    ) 
     # =======================================================
         
     evaluate_during_training: bool = field(
@@ -968,18 +1067,18 @@ def main():
                 num_labels=num_labels,
                 finetuning_task=data_args.task_name,
                 cache_dir=model_args.cache_dir,
-                apply_forward_delta=data_args.apply_forward_delta,
+                # apply_forward_delta=data_args.apply_forward_delta,
                 # config其实无需修改， 真正的功能是后面的 replace 函数， provider 先在这里传 none , 目前是因为懒得修改了， 一些冗余的代码后面在修改，
-                uv_provider=None,   
-                z_provider=None,
-                enable_x=data_args.enable_x,
-                enable_diffx=data_args.enable_diffx,
-                enable_w=data_args.enable_w,
-                enable_diffw=data_args.enable_diffw,
-                mx_w_elem_format=data_args.mx_w_elem_format,
-                mx_a_elem_format=data_args.mx_a_elem_format,
-                mx_diffw_elem_format=data_args.mx_diffw_elem_format,
-                mx_diffa_elem_format=data_args.mx_diffa_elem_format,
+                # uv_provider=None,   
+                # z_provider=None,
+                # enable_x=data_args.enable_x,
+                # enable_diffx=data_args.enable_diffx,
+                # enable_w=data_args.enable_w,
+                # enable_diffw=data_args.enable_diffw,
+                # mx_w_elem_format=data_args.mx_w_elem_format,
+                # mx_a_elem_format=data_args.mx_a_elem_format,
+                # mx_diffw_elem_format=data_args.mx_diffw_elem_format,
+                # mx_diffa_elem_format=data_args.mx_diffa_elem_format,
                 **config_kwargs)
         else:
             config = OPTConfig.from_pretrained(
@@ -1144,6 +1243,8 @@ def main():
         print(f"model:{model}")
         
         
+    apply_trainable_mode(model, training_args.trainable_mode, logger=logger)
+    
     
     # Build metric
     def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
@@ -1203,8 +1304,15 @@ def main():
                                    mx_w_elem_format=data_args.mx_w_elem_format, mx_a_elem_format=data_args.mx_a_elem_format, mx_diffw_elem_format=data_args.mx_diffw_elem_format, mx_diffa_elem_format=data_args.mx_diffa_elem_format, 
                                    enable_w=data_args.enable_w, enable_x=data_args.enable_x, enable_diffx=data_args.enable_diffx, enable_diffw=data_args.enable_diffw, 
                                    uv_provider=uv_provider, z_provider=z_provider)
+            apply_trainable_mode(model, training_args.trainable_mode, logger=logger)
         logger.info("Replace All nnLayers with diffLayers to support forward_delta")
         print(f"model:{model}") 
+        
+    print("[ARGS CHECK]", getattr(training_args, "debug_forward_delta", "MISSING"),
+      getattr(training_args, "debug_forward_delta_steps", "MISSING"),
+      getattr(training_args, "debug_forward_delta_tol", "MISSING"),
+      getattr(training_args, "debug_forward_delta_abort", "MISSING"),
+      flush=True)
         
     
     # Use QdiffLinear
