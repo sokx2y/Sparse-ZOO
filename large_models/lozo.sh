@@ -47,7 +47,7 @@ elif [ "$MODE" == "lora" ]; then
 fi
 
 LR=1e-7
-TASK=SST2
+TASK=Copa
 SEED=0
 RANK=2
 STEP_INTERVAL=100
@@ -89,7 +89,7 @@ case $TASK in
         ;;
 esac
 
-TAG=$Tainer-$MODEL_NAME-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK
+TAG=$Tainer-$MODEL_NAME-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK-$TASK
 
 if [ "$APPLY_FORWARD_DELTA" = "true" ]; then
     ENABLE="Quantdiff-${TRAINABLE_MODE}"

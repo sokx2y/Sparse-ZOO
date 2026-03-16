@@ -16,7 +16,8 @@ except Exception as e:
     raise ImportError(
         "microxcaling 未安装或不可用。请先 `pip install microxcaling` 并确保有 CUDA 环境。"
     ) from e
-               
+            
+   
 class diffLinear(nn.Linear):
     def __init__(
         self,
@@ -45,6 +46,7 @@ class diffLinear(nn.Linear):
                 self.weight.dtype,
                 self.inference_count
             )
+            # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_u[0]:{u[0]}, fake_v[0]:{v[0]}")
             out_dim = diff_output.size(-1)
             r = v.size(-1)
 
@@ -65,10 +67,11 @@ class diffLinear(nn.Linear):
                 self.bias.dtype,
                 self.inference_count
             )
+            # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z[0]:{z[0]}")
             diff_bias = z * bias_scale  # [out]
             view_shape = [1] * (diff_output.dim() - 1) + [-1]
             diff_output.add_(diff_bias.view(*view_shape))
-
+            
         return output, diff_output
     
     
@@ -372,10 +375,11 @@ def QuantizeRobertaForLOZO(
     def replace_roberta_module(module, prefix=""):
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
-            print(f"Checking layer: {full_name}")
+            # print(f"Checking layer: {full_name}")
 
             in_encoder = full_name.startswith("roberta.encoder")
             in_embeddings = full_name.startswith("roberta.embeddings")
+            
 
             if in_embeddings and isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
                 new_emb = diffEmbedding(
@@ -393,7 +397,7 @@ def QuantizeRobertaForLOZO(
                 )
                 new_emb.weight.data = child.weight.data.clone()
                 setattr(module, name, new_emb)
-                print(f"Replace {full_name} with diffEmbedding")
+                # print(f"Replace {full_name} with diffEmbedding")
                 continue
             
             # 别忘记这里应该是QdiffLinear
@@ -495,10 +499,16 @@ def QuantizeOPTForLOZO(
     def replace_opt_module(module, prefix=""):
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
-            print(f"Checking layer: {full_name}")
+            # print(f"Checking layer: {full_name}")
 
             in_decoder_layers = full_name.startswith("model.decoder.layers")
             is_lm_head = (full_name == "lm_head")
+            
+            if child.__class__.__name__ == "OPTLearnedPositionalEmbedding":
+                child.layer_name = full_name
+                child.uv_provider = uv_provider
+                print(f"Patch {full_name} with layer_name/uv_provider for forward_delta")
+                continue
 
             if isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
                 new_emb = diffEmbedding(
@@ -516,7 +526,7 @@ def QuantizeOPTForLOZO(
                 )
                 new_emb.weight = child.weight
                 setattr(module, name, new_emb)
-                print(f"Replace {full_name} with diffEmbedding (share weight)")
+                # print(f"Replace {full_name} with diffEmbedding (share weight)")
                 continue
 
             # if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
@@ -560,7 +570,7 @@ def QuantizeOPTForLOZO(
                 if child.bias is not None:
                     new_head.bias = child.bias
                 setattr(module, name, new_head)
-                print(f"Replace {full_name} with diffLinear (share params)")
+                # print(f"Replace {full_name} with diffLinear (share params)")
                 continue
 
             if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
@@ -578,7 +588,7 @@ def QuantizeOPTForLOZO(
                 if child.bias is not None:
                     new_head.bias = child.bias
                 setattr(module, name, new_head)
-                print(f"Replace {full_name} with diffLinear (share params)")
+                # print(f"Replace {full_name} with diffLinear (share params)")
                 continue
 
             if isinstance(child, nn.LayerNorm) and not isinstance(child, diffLayerNorm):
@@ -596,7 +606,7 @@ def QuantizeOPTForLOZO(
                 if child.bias is not None:
                     new_ln.bias = child.bias
                 setattr(module, name, new_ln)
-                print(f"Replace {full_name} with diffLayerNorm (share params)")
+                # print(f"Replace {full_name} with diffLayerNorm (share params)")
                 continue
 
             # 递归
@@ -608,6 +618,12 @@ def QuantizeOPTForLOZO(
         if getattr(model.config, "tie_word_embeddings", False):
             try:
                 model.tie_weights()
+                # tied 情况下，让 lm_head 的 delta key 复用 embed_tokens
+                if hasattr(model, "lm_head") and isinstance(model.lm_head, diffLinear):
+                    model.lm_head.layer_name = "model.decoder.embed_tokens"
+                    model.lm_head.uv_provider = uv_provider
+                    model.lm_head.z_provider = z_provider
+                    print("[PATCH] tied lm_head delta key -> model.decoder.embed_tokens")
             except Exception as e:
                 print(f"[WARN] model.tie_weights() failed: {e}")
 

@@ -179,7 +179,7 @@ class OPTLearnedPositionalEmbedding(diffEmbedding):
         attention_mask = attention_mask.long()
         positions = (torch.cumsum(attention_mask, dim=1).type_as(attention_mask) * attention_mask).long() - 1
         positions = positions[:, past_key_values_length:]
-        # 关键：把 positions+offset 当成 embedding 的 input ids，直接复用 diffEmbedding.forward_delta
+        # 把 positions+offset 当成 embedding 的 input ids，直接复用 diffEmbedding.forward_delta
         return super().forward_delta(positions + self.offset)
 
 

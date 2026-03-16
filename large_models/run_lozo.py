@@ -205,6 +205,7 @@ class Framework:
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
                 )
+                # model.config.use_cache = False
             elif self.args.no_auto_device:
                 # No auto device (use for FSDP)
                 # model = AutoModelForCausalLM.from_pretrained(
@@ -215,6 +216,7 @@ class Framework:
                     self.args.model_name if self.args.model_path is None else self.args.model_path,
                     config=config,
                 )
+                # model.config.use_cache = False
             else:
                 # Auto device loading
                 torch_dtype = torch.float32
@@ -238,7 +240,9 @@ class Framework:
                     max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
                     load_in_8bit=self.args.load_int8,
                 )
+                # model.config.use_cache = False
             model.eval()
+            print("do_layer_norm_before =", model.model.decoder.layers[0].do_layer_norm_before)
             print(model)
 
         # Load tokenizer
