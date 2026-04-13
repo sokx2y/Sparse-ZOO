@@ -36,6 +36,8 @@ class diffLinear(nn.Linear):
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor):
         self.inference_count += 1
+        # if self.inference_count == 2:
+        #     print(f"input:{input.shape}; layername:{self.layer_name}")
         output = F.linear(input, self.weight, self.bias)
         diff_output = F.linear(diff_input, self.weight, None)
         if self.uv_provider is not None:
@@ -156,6 +158,7 @@ class QdiffLinear(nn.Linear):
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor) -> torch.Tensor:
         self.inference_count += 1
+        
         # ground state output
         output = mx_linear(input, self.weight, self.bias, mx_specs=self.mx_specs0)
         
@@ -401,48 +404,48 @@ def QuantizeRobertaForLOZO(
                 continue
             
             # 别忘记这里应该是QdiffLinear
-            # if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
-            #     new_qlinear = QdiffLinear(
-            #         enable_x=enable_x,
-            #         enable_diffx=enable_diffx,
-            #         enable_w=enable_w,
-            #         enable_diffw=enable_diffw,
-            #         layer_name=full_name,
-            #         in_features=child.in_features,
-            #         out_features=child.out_features,
-            #         bias=(child.bias is not None),
-            #         device=child.weight.device,
-            #         dtype=child.weight.dtype,
-            #         mx_w_elem_format=mx_w_elem_format,
-            #         mx_a_elem_format=mx_a_elem_format,
-            #         mx_diffw_elem_format=mx_diffw_elem_format,
-            #         mx_diffa_elem_format=mx_diffa_elem_format,
-            #         uv_provider=uv_provider,
-            #         z_provider=z_provider,
-            #     )
-            #     new_qlinear.weight.data = child.weight.data.clone()
-            #     if child.bias is not None:
-            #         new_qlinear.bias.data = child.bias.data.clone()
-            #     setattr(module, name, new_qlinear)
-            #     print(f"Replace {full_name} with QdiffLinear")
-            #     continue
-            if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
-                new_dlinear = diffLinear(
+            if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
+                new_qlinear = QdiffLinear(
+                    enable_x=enable_x,
+                    enable_diffx=enable_diffx,
+                    enable_w=enable_w,
+                    enable_diffw=enable_diffw,
                     layer_name=full_name,
                     in_features=child.in_features,
                     out_features=child.out_features,
                     bias=(child.bias is not None),
                     device=child.weight.device,
                     dtype=child.weight.dtype,
+                    mx_w_elem_format=mx_w_elem_format,
+                    mx_a_elem_format=mx_a_elem_format,
+                    mx_diffw_elem_format=mx_diffw_elem_format,
+                    mx_diffa_elem_format=mx_diffa_elem_format,
                     uv_provider=uv_provider,
                     z_provider=z_provider,
                 )
-                new_dlinear.weight.data = child.weight.data.clone()
+                new_qlinear.weight.data = child.weight.data.clone()
                 if child.bias is not None:
-                    new_dlinear.bias.data = child.bias.data.clone()
-                setattr(module, name, new_dlinear)
-                print(f"Replace {full_name} with diffLinear")
+                    new_qlinear.bias.data = child.bias.data.clone()
+                setattr(module, name, new_qlinear)
+                print(f"Replace {full_name} with QdiffLinear")
                 continue
+            # if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+            #     new_dlinear = diffLinear(
+            #         layer_name=full_name,
+            #         in_features=child.in_features,
+            #         out_features=child.out_features,
+            #         bias=(child.bias is not None),
+            #         device=child.weight.device,
+            #         dtype=child.weight.dtype,
+            #         uv_provider=uv_provider,
+            #         z_provider=z_provider,
+            #     )
+            #     new_dlinear.weight.data = child.weight.data.clone()
+            #     if child.bias is not None:
+            #         new_dlinear.bias.data = child.bias.data.clone()
+            #     setattr(module, name, new_dlinear)
+            #     print(f"Replace {full_name} with diffLinear")
+            #     continue
             
             if (not in_encoder) and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
                 new_dlinear = diffLinear(
@@ -503,6 +506,7 @@ def QuantizeOPTForLOZO(
 
             in_decoder_layers = full_name.startswith("model.decoder.layers")
             is_lm_head = (full_name == "lm_head")
+            is_proj_inout = full_name in ("model.decoder.project_in", "model.decoder.project_out")
             
             if child.__class__.__name__ == "OPTLearnedPositionalEmbedding":
                 child.layer_name = full_name
@@ -529,33 +533,51 @@ def QuantizeOPTForLOZO(
                 # print(f"Replace {full_name} with diffEmbedding (share weight)")
                 continue
 
-            # if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
-            #     new_qlinear = QdiffLinear(
-            #         enable_x=enable_x,
-            #         enable_diffx=enable_diffx,
-            #         enable_w=enable_w,
-            #         enable_diffw=enable_diffw,
+            if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
+                new_qlinear = QdiffLinear(
+                    enable_x=enable_x,
+                    enable_diffx=enable_diffx,
+                    enable_w=enable_w,
+                    enable_diffw=enable_diffw,
+                    layer_name=full_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",                
+                    dtype=child.weight.dtype,
+                    mx_w_elem_format=mx_w_elem_format,
+                    mx_a_elem_format=mx_a_elem_format,
+                    mx_diffw_elem_format=mx_diffw_elem_format,
+                    mx_diffa_elem_format=mx_diffa_elem_format,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_qlinear.weight = child.weight
+                if child.bias is not None:
+                    new_qlinear.bias = child.bias
+                setattr(module, name, new_qlinear)
+                print(f"Replace {full_name} with QdiffLinear (share params)")
+                continue
+            
+            # if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+            #     new_head = diffLinear(
             #         layer_name=full_name,
             #         in_features=child.in_features,
             #         out_features=child.out_features,
             #         bias=(child.bias is not None),
-            #         device="meta",                
+            #         device="meta",              
             #         dtype=child.weight.dtype,
-            #         mx_w_elem_format=mx_w_elem_format,
-            #         mx_a_elem_format=mx_a_elem_format,
-            #         mx_diffw_elem_format=mx_diffw_elem_format,
-            #         mx_diffa_elem_format=mx_diffa_elem_format,
             #         uv_provider=uv_provider,
             #         z_provider=z_provider,
             #     )
-            #     new_qlinear.weight = child.weight
+            #     new_head.weight = child.weight
             #     if child.bias is not None:
-            #         new_qlinear.bias = child.bias
-            #     setattr(module, name, new_qlinear)
-            #     print(f"Replace {full_name} with QdiffLinear (share params)")
+            #         new_head.bias = child.bias
+            #     setattr(module, name, new_head)
+            #     # print(f"Replace {full_name} with diffLinear (share params)")
             #     continue
             
-            if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+            if is_proj_inout and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
                 new_head = diffLinear(
                     layer_name=full_name,
                     in_features=child.in_features,

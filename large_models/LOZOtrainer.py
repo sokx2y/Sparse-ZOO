@@ -709,139 +709,188 @@ class LowRankTrainer(Trainer):
 
 
     # =========================================== LOZO Functions ==============================================================
-    def _debug_resolve_param_name(self, param_dict, target_name):
-        if target_name in param_dict:
-            return target_name
-        for name in param_dict.keys():
-            if name.endswith(target_name):
-                return name
-        return None
-
-    def _debug_capture_param_snapshot(self, model):
-        param_dict = dict(model.named_parameters())
-        snapshot = {}
-        for target_name in self.debug_roundtrip_param_names:
-            resolved_name = self._debug_resolve_param_name(param_dict, target_name)
-            if resolved_name is None:
-                print(f"[DEBUG][roundtrip] missing param in model.named_parameters(): {target_name}", flush=True)
-                continue
-            snapshot[resolved_name] = param_dict[resolved_name].detach().clone()
-        return snapshot
-    
-    def _debug_report_roundtrip(self, model, snapshot, tag=""):
-        if not snapshot:
-            print(f"[DEBUG][roundtrip] no snapshot captured {tag}", flush=True)
-            return
-    
-        param_dict = dict(model.named_parameters())
-        max_diff_all = 0.0
-        for name, ref in snapshot.items():
-            if name not in param_dict:
-                print(f"[DEBUG][roundtrip] param disappeared: {name}", flush=True)
-                continue
-            cur = param_dict[name].detach()
-            diff = (cur - ref).abs().max().item()
-            max_diff_all = max(max_diff_all, diff)
-            print(f"[DEBUG][roundtrip] {name} max_abs_diff={diff:.10e}", flush=True)
-    
-        print(f"[DEBUG][roundtrip] overall max_abs_diff={max_diff_all:.10e} {tag}", flush=True)
-    
-    def _debug_log_provider(self, kind, param_name, *, z_hit=None, u_hit=None, v_hit=None, shape=None, inference_count=None):
-        if not self.debug_provider_hits:
-            return
-    
-        key = (kind, param_name)
-        if key in self.debug_provider_seen:
-            return
-        if len(self.debug_provider_seen) >= self.debug_provider_max_print:
-            return
-    
-        self.debug_provider_seen.add(key)
-        parts = [f"[DEBUG][{kind}]", f"name={param_name}"]
-        if inference_count is not None:
-            parts.append(f"inference_count={inference_count}")
-        if shape is not None:
-            parts.append(f"shape={tuple(shape)}")
-        if z_hit is not None:
-            parts.append(f"z_hit={z_hit}")
-        if u_hit is not None:
-            parts.append(f"u_hit={u_hit}")
-        if v_hit is not None:
-            parts.append(f"v_hit={v_hit}")
-        print(" ".join(parts), flush=True)
-        
-    def _debug_capture_old_forward_outputs(self, model, inputs, module_names):
-        captured = {}
-        hooks = []
-    
-        name_to_module = dict(model.named_modules())
-    
-        for name in module_names:
-            if name not in name_to_module:
-                print(f"[DEBUG][hook] missing module: {name}", flush=True)
-                continue
-    
-            module = name_to_module[name]
-    
-            def make_hook(module_name):
-                def hook(mod, inp, out):
-                    out0 = out[0] if isinstance(out, tuple) else out
-                    if torch.is_tensor(out0):
-                        captured[module_name] = out0.detach().float().clone()
-                return hook
-    
-            hooks.append(module.register_forward_hook(make_hook(name)))
-    
-        with torch.no_grad():
-            loss = self.zo_forward(model, inputs, with_delta=False)   
-    
-        for h in hooks:
-            h.remove()
-    
-        return captured, loss    
-    
-    def _debug_capture_forward_delta_outputs(self, model, inputs, module_names):
-        captured = {}
-        name_to_module = dict(model.named_modules())
-        patched = []  # (module, original_forward_delta)
-    
-        def make_wrapper(module_name, orig_fn):
-            def wrapped(*args, **kwargs):
-                out = orig_fn(*args, **kwargs)
-                # diff* 模块 forward_delta 期望返回 (base, diff)
-                if isinstance(out, (tuple, list)) and len(out) >= 2 and torch.is_tensor(out[0]) and torch.is_tensor(out[1]):
-                    base, diff = out[0], out[1]
-                    captured[module_name] = {
-                        "base": base.detach().float().clone(),
-                        "pert": (base + diff).detach().float().clone(),
-                    }
-                return out
-            return wrapped
-    
-        # patch
-        for name in module_names:
-            if name not in name_to_module:
-                print(f"[DEBUG][fd_hook] missing module: {name}", flush=True)
-                continue
-            m = name_to_module[name]
-            if not hasattr(m, "forward_delta"):
-                print(f"[DEBUG][fd_hook] module has no forward_delta: {name}", flush=True)
-                continue
-            orig = m.forward_delta
-            m.forward_delta = make_wrapper(name, orig)
-            patched.append((m, orig))
-    
-        try:
-            with torch.no_grad():
-                loss_base, loss_pert = self.zo_forward(model, inputs, with_delta=True)  
-        finally:
-            # restore
-            for m, orig in patched:
-                m.forward_delta = orig
-    
-        return captured, loss_base, loss_pert 
+    # def _debug_resolve_param_name(self, param_dict, target_name):
+    #     if target_name in param_dict:
+    #         return target_name
+    #     for name in param_dict.keys():
+    #         if name.endswith(target_name):
+    #             return name
+    #     return None
+# 
+    # def _debug_capture_param_snapshot(self, model):
+    #     param_dict = dict(model.named_parameters())
+    #     snapshot = {}
+    #     for target_name in self.debug_roundtrip_param_names:
+    #         resolved_name = self._debug_resolve_param_name(param_dict, target_name)
+    #         if resolved_name is None:
+    #             print(f"[DEBUG][roundtrip] missing param in model.named_parameters(): {target_name}", flush=True)
+    #             continue
+    #         snapshot[resolved_name] = param_dict[resolved_name].detach().clone()
+    #     return snapshot
+    # 
+    # def _debug_report_roundtrip(self, model, snapshot, tag=""):
+    #     if not snapshot:
+    #         print(f"[DEBUG][roundtrip] no snapshot captured {tag}", flush=True)
+    #         return
+    # 
+    #     param_dict = dict(model.named_parameters())
+    #     max_diff_all = 0.0
+    #     for name, ref in snapshot.items():
+    #         if name not in param_dict:
+    #             print(f"[DEBUG][roundtrip] param disappeared: {name}", flush=True)
+    #             continue
+    #         cur = param_dict[name].detach()
+    #         diff = (cur - ref).abs().mean().item()
+    #         max_diff_all = max(max_diff_all, diff)
+    #         print(f"[DEBUG][roundtrip] {name} max_abs_diff={diff:.10e}", flush=True)
+    # 
+    #     print(f"[DEBUG][roundtrip] overall max_abs_diff={max_diff_all:.10e} {tag}", flush=True)
+    # 
+    # def _debug_log_provider(self, kind, param_name, *, z_hit=None, u_hit=None, v_hit=None, shape=None, inference_count=None):
+    #     if not self.debug_provider_hits:
+    #         return
+    # 
+    #     key = (kind, param_name)
+    #     if key in self.debug_provider_seen:
+    #         return
+    #     if len(self.debug_provider_seen) >= self.debug_provider_max_print:
+    #         return
+    # 
+    #     self.debug_provider_seen.add(key)
+    #     parts = [f"[DEBUG][{kind}]", f"name={param_name}"]
+    #     if inference_count is not None:
+    #         parts.append(f"inference_count={inference_count}")
+    #     if shape is not None:
+    #         parts.append(f"shape={tuple(shape)}")
+    #     if z_hit is not None:
+    #         parts.append(f"z_hit={z_hit}")
+    #     if u_hit is not None:
+    #         parts.append(f"u_hit={u_hit}")
+    #     if v_hit is not None:
+    #         parts.append(f"v_hit={v_hit}")
+    #     print(" ".join(parts), flush=True)
+    #     
+    # def _debug_capture_old_forward_outputs(self, model, inputs, module_names):
+    #     captured = {}
+    #     hooks = []
+    # 
+    #     name_to_module = dict(model.named_modules())
+    # 
+    #     for name in module_names:
+    #         if name not in name_to_module:
+    #             print(f"[DEBUG][hook] missing module: {name}", flush=True)
+    #             continue
+    # 
+    #         module = name_to_module[name]
+    # 
+    #         def make_hook(module_name):
+    #             def hook(mod, inp, out):
+    #                 out0 = out[0] if isinstance(out, tuple) else out
+    #                 if torch.is_tensor(out0):
+    #                     captured[module_name] = out0.detach().float().clone()
+    #             return hook
+    # 
+    #         hooks.append(module.register_forward_hook(make_hook(name)))
+    # 
+    #     with torch.no_grad():
+    #         loss = self.zo_forward(model, inputs, with_delta=False)   
+    # 
+    #     for h in hooks:
+    #         h.remove()
+    # 
+    #     return captured, loss    
+    # 
+    # def _debug_capture_forward_delta_outputs(self, model, inputs, module_names):
+    #     captured = {}
+    #     name_to_module = dict(model.named_modules())
+    #     patched = []  # (module, original_forward_delta)
+    # 
+    #     def make_wrapper(module_name, orig_fn):
+    #         def wrapped(*args, **kwargs):
+    #             out = orig_fn(*args, **kwargs)
+    #             # diff* 模块 forward_delta 期望返回 (base, diff)
+    #             if isinstance(out, (tuple, list)) and len(out) >= 2 and torch.is_tensor(out[0]) and torch.is_tensor(out[1]):
+    #                 base, diff = out[0], out[1]
+    #                 captured[module_name] = {
+    #                     "base": base.detach().float().clone(),
+    #                     "pert": (base + diff).detach().float().clone(),
+    #                 }
+    #             return out
+    #         return wrapped
+    # 
+    #     # patch
+    #     for name in module_names:
+    #         if name not in name_to_module:
+    #             print(f"[DEBUG][fd_hook] missing module: {name}", flush=True)
+    #             continue
+    #         m = name_to_module[name]
+    #         if not hasattr(m, "forward_delta"):
+    #             print(f"[DEBUG][fd_hook] module has no forward_delta: {name}", flush=True)
+    #             continue
+    #         orig = m.forward_delta
+    #         m.forward_delta = make_wrapper(name, orig)
+    #         patched.append((m, orig))
+    # 
+    #     try:
+    #         with torch.no_grad():
+    #             loss_base, loss_pert = self.zo_forward(model, inputs, with_delta=True)  
+    #     finally:
+    #         # restore
+    #         for m, orig in patched:
+    #             m.forward_delta = orig
+    # 
+    #     return captured, loss_base, loss_pert 
         
     # ------ DEBUGGING UPUPUP -----    
+
+    # debug:  do perturbation math in fp32 and cast back to original param dtype at the end
+    # def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
+    #     args = self.args
+    #     step = self.step
+    # 
+    #     # start of one perturbation sequence
+    #     if scaling_factor == 1 and (not hasattr(self, "_zo_base_params")):
+    #         self._zo_base_params = {
+    #             name: param.data.float().clone()
+    #             for name, param in self.named_parameters_to_optim
+    #         }
+    #         self._zo_coeff = 0
+    # 
+    #     self._zo_coeff += scaling_factor
+    # 
+    #     torch.manual_seed(random_seed if random_seed is not None else self.zo_random_seed)
+    # 
+    #     for name, param in self.named_parameters_to_optim:
+    #         base = self._zo_base_params[name]
+    #         orig_dtype = param.data.dtype
+    # 
+    #         if param.data.ndim >= 2:
+    #             if step % args.step_interval == 0:
+    #                 v = torch.randn(param.data.size(1), args.rank_r, device=param.data.device, dtype=orig_dtype)
+    #                 self.v[name] = v
+    #             else:
+    #                 v = self.v[name]
+    # 
+    #             u = self.random_gaussian_matrix(
+    #                 m=param.data.size(0), n=args.rank_r,
+    #                 device=param.data.device, dtype=orig_dtype
+    #             )
+    #             self.u[name] = u
+    # 
+    #             delta = (u.float() @ v.float().t()) * self.args.zo_eps
+    #             param.data.copy_((base + self._zo_coeff * delta).to(orig_dtype))
+    # 
+    #         else:
+    #             z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=orig_dtype)
+    #             self.z[name] = z
+    # 
+    #             delta = z.float() * self.args.zo_eps
+    #             param.data.copy_((base + self._zo_coeff * delta).to(orig_dtype))
+    # 
+    #     # end of sequence: back to base
+    #     if self._zo_coeff == 0:
+    #         del self._zo_base_params
+    #         del self._zo_coeff
 
     def lowrank_zo_perturb_parameters(self, random_seed=None, scaling_factor=1):
         """
@@ -988,7 +1037,8 @@ class LowRankTrainer(Trainer):
         """
         Estimate gradient by Lowrank-zo. Return the loss from f(theta + uv^t)
         """
-        args = self.args
+        
+        args = self.args    
         if hasattr(self, 'step'):
             self.step += 1
         else:
@@ -1003,96 +1053,103 @@ class LowRankTrainer(Trainer):
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
         
+        # debug minibatch 
+        # if self.step == 0:
+        #     x = inputs["input_ids"]
+        #     print("[BATCH-CHECK] shape =", tuple(x.shape))
+        #     print("[BATCH-CHECK] first row first 16 =", x[0, :16].tolist())
+        #     print("[BATCH-CHECK] sum =", int(x.sum().item()))
+        
         
         # debug!!!
-        if self.debug_forward_delta and self.step < 10:
-            roundtrip_snapshot = self._debug_capture_param_snapshot(model)
-            targets = [
-                "model.decoder.embed_tokens",
-                "model.decoder.embed_positions",
-                "model.decoder.layers.0.self_attn.q_proj",
-                "model.decoder.layers.0.self_attn.k_proj",
-                "model.decoder.layers.0.self_attn.v_proj",
-                "model.decoder.layers.0.self_attn.out_proj",
-                "model.decoder.layers.0.fc1",
-                "model.decoder.layers.0.fc2",
-                "model.decoder.layers.0.self_attn_layer_norm",
-                "model.decoder.layers.0.final_layer_norm",
-            ]
-        
-            # old +eps
-            self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        # if self.debug_forward_delta and self.step < 10:
+        #     roundtrip_snapshot = self._debug_capture_param_snapshot(model)
+        #     targets = [
+        #         "model.decoder.embed_tokens",
+        #         "model.decoder.embed_positions",
+        #         "model.decoder.layers.0.self_attn.q_proj",
+        #         "model.decoder.layers.0.self_attn.k_proj",
+        #         "model.decoder.layers.0.self_attn.v_proj",
+        #         "model.decoder.layers.0.self_attn.out_proj",
+        #         "model.decoder.layers.0.fc1",
+        #         "model.decoder.layers.0.fc2",
+        #         "model.decoder.layers.0.self_attn_layer_norm",
+        #         "model.decoder.layers.0.final_layer_norm",
+        #     ]
+        # 
+        #     # old +eps
+        #     self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        #     
+        #     # for k in [
+        #     #     "model.decoder.layers.0.self_attn_layer_norm.weight",
+        #     #     "model.decoder.layers.0.self_attn_layer_norm.bias",
+        #     #     "model.decoder.layers.0.final_layer_norm.weight",
+        #     #     "model.decoder.layers.0.final_layer_norm.bias",
+        #     # ]:
+        #     #     print("[DEBUG][z-check]", k, "in self.z =", k in self.z)
+        #         
+        #     old_plus_out, loss_plus = self._debug_capture_old_forward_outputs(model, inputs, targets)
+        #     # now run forward_delta at +eps
+        #     new_out, loss_base, loss_pert = self._debug_capture_forward_delta_outputs(model, inputs, targets)
+        #     
+        #     # old -eps
+        #     self.lowrank_zo_perturb_parameters(scaling_factor=-2)
+        # 
+        #     ln_attn = model.model.decoder.layers[0].self_attn_layer_norm
+        #     ln_ffn  = model.model.decoder.layers[0].final_layer_norm
+        #     attn_ln_w_minus_old = ln_attn.weight.detach().clone()
+        #     attn_ln_b_minus_old = ln_attn.bias.detach().clone()
+        #     ffn_ln_w_minus_old  = ln_ffn.weight.detach().clone()
+        #     ffn_ln_b_minus_old  = ln_ffn.bias.detach().clone()
+        #     
+        #     old_minus_out, loss_minus = self._debug_capture_old_forward_outputs(model, inputs, targets)
+        #     # back to +eps then new forward_delta
+            # self.lowrank_zo_perturb_parameters(scaling_factor=2)
             
-            # for k in [
-            #     "model.decoder.layers.0.self_attn_layer_norm.weight",
-            #     "model.decoder.layers.0.self_attn_layer_norm.bias",
-            #     "model.decoder.layers.0.final_layer_norm.weight",
-            #     "model.decoder.layers.0.final_layer_norm.bias",
-            # ]:
-            #     print("[DEBUG][z-check]", k, "in self.z =", k in self.z)
-                
-            old_plus_out, loss_plus = self._debug_capture_old_forward_outputs(model, inputs, targets)
-            # now run forward_delta at +eps
-            new_out, loss_base, loss_pert = self._debug_capture_forward_delta_outputs(model, inputs, targets)
-            
-            # old -eps
-            self.lowrank_zo_perturb_parameters(scaling_factor=-2)
-        
-            ln_attn = model.model.decoder.layers[0].self_attn_layer_norm
-            ln_ffn  = model.model.decoder.layers[0].final_layer_norm
-            attn_ln_w_minus_old = ln_attn.weight.detach().clone()
-            attn_ln_b_minus_old = ln_attn.bias.detach().clone()
-            ffn_ln_w_minus_old  = ln_ffn.weight.detach().clone()
-            ffn_ln_b_minus_old  = ln_ffn.bias.detach().clone()
-            
-            old_minus_out, loss_minus = self._debug_capture_old_forward_outputs(model, inputs, targets)
-            # back to +eps then new forward_delta
-            self.lowrank_zo_perturb_parameters(scaling_factor=2)
-            
-            scale = -2 * self.args.zo_eps
-            attn_ln_w_minus_new = ln_attn.weight.detach() + self.z["model.decoder.layers.0.self_attn_layer_norm.weight"] * scale
-            attn_ln_b_minus_new = ln_attn.bias.detach()   + self.z["model.decoder.layers.0.self_attn_layer_norm.bias"] * scale
-            ffn_ln_w_minus_new  = ln_ffn.weight.detach()  + self.z["model.decoder.layers.0.final_layer_norm.weight"] * scale
-            ffn_ln_b_minus_new  = ln_ffn.bias.detach()    + self.z["model.decoder.layers.0.final_layer_norm.bias"] * scale
-        
-            print("[DEBUG][ln-param] attn_ln.weight old_minus vs rebuild max_abs =",
-                  float((attn_ln_w_minus_old - attn_ln_w_minus_new).abs().max()))
-            print("[DEBUG][ln-param] attn_ln.bias   old_minus vs rebuild max_abs =",
-                  float((attn_ln_b_minus_old - attn_ln_b_minus_new).abs().max()))
-            print("[DEBUG][ln-param] ffn_ln.weight  old_minus vs rebuild max_abs =",
-                  float((ffn_ln_w_minus_old - ffn_ln_w_minus_new).abs().max()))
-            print("[DEBUG][ln-param] ffn_ln.bias    old_minus vs rebuild max_abs =",
-                  float((ffn_ln_b_minus_old - ffn_ln_b_minus_new).abs().max()))
+            # scale = -2 * self.args.zo_eps
+            # attn_ln_w_minus_new = ln_attn.weight.detach() + self.z["model.decoder.layers.0.self_attn_layer_norm.weight"] * scale
+            # attn_ln_b_minus_new = ln_attn.bias.detach()   + self.z["model.decoder.layers.0.self_attn_layer_norm.bias"] * scale
+            # ffn_ln_w_minus_new  = ln_ffn.weight.detach()  + self.z["model.decoder.layers.0.final_layer_norm.weight"] * scale
+            # ffn_ln_b_minus_new  = ln_ffn.bias.detach()    + self.z["model.decoder.layers.0.final_layer_norm.bias"] * scale
+        # 
+            # print("[DEBUG][ln-param] attn_ln.weight old_minus vs rebuild max_abs =",
+            #       float((attn_ln_w_minus_old - attn_ln_w_minus_new).abs().max()))
+            # print("[DEBUG][ln-param] attn_ln.bias   old_minus vs rebuild max_abs =",
+            #       float((attn_ln_b_minus_old - attn_ln_b_minus_new).abs().max()))
+            # print("[DEBUG][ln-param] ffn_ln.weight  old_minus vs rebuild max_abs =",
+            #       float((ffn_ln_w_minus_old - ffn_ln_w_minus_new).abs().max()))
+            # print("[DEBUG][ln-param] ffn_ln.bias    old_minus vs rebuild max_abs =",
+            #       float((ffn_ln_b_minus_old - ffn_ln_b_minus_new).abs().max()))
         
             
-            
-            
-            print("[DEBUG] loss_plus(old)  =", float(loss_plus))
-            print("[DEBUG] loss_base(new)  =", float(loss_base))
-            print("[DEBUG] abs diff (+)    =", float((loss_plus - loss_base).abs()))
-            print("[DEBUG] loss_minus(old) =", float(loss_minus))
-            print("[DEBUG] loss_pert(new)  =", float(loss_pert))
-            print("[DEBUG] abs diff (-)    =", float((loss_minus - loss_pert).abs()))
-        
-            g_old = ((loss_plus - loss_minus) / (2 * self.args.zo_eps)).item()
-            g_new = ((loss_base - loss_pert) / (2 * self.args.zo_eps)).item()
-            print("[DEBUG] proj_grad old =", g_old)
-            print("[DEBUG] proj_grad new =", g_new)
-            print("[DEBUG] grad abs diff =", abs(g_old - g_new))
-        
-            # layer-wise check（这次对拍是严谨的：old_plus 对 new_base，old_minus 对 new_pert）
-            for name in targets:
-                if name in old_plus_out and name in old_minus_out and name in new_out:
-                    plus_err = (old_plus_out[name] - new_out[name]["base"]).abs().max().item()
-                    minus_err = (old_minus_out[name] - new_out[name]["pert"]).abs().max().item()
-                    print(f"[LAYER-CHECK] {name} plus_err={plus_err:.6e} minus_err={minus_err:.6e}", flush=True)
-                else:
-                    print(f"[LAYER-CHECK] missing {name} (old_plus={name in old_plus_out}, old_minus={name in old_minus_out}, new={name in new_out})", flush=True)
-        
             # restore to original params
-            self.lowrank_zo_perturb_parameters(scaling_factor=-1)
-            self._debug_report_roundtrip(model, roundtrip_snapshot, tag=f"after +1/-2/+2/-1 at step={self.step}")
-
+        #     self.lowrank_zo_perturb_parameters(scaling_factor=1)
+        #     self._debug_report_roundtrip(model, roundtrip_snapshot, tag=f"after +1/-2/+1 at step={self.step}")
+        #     
+        #     print("[DEBUG] loss_plus(old)  =", float(loss_plus))
+        #     print("[DEBUG] loss_base(new)  =", float(loss_base))
+        #     print("[DEBUG] abs diff (+)    =", float((loss_plus - loss_base).abs()))
+        #     print("[DEBUG] loss_minus(old) =", float(loss_minus))
+        #     print("[DEBUG] loss_pert(new)  =", float(loss_pert))
+        #     print("[DEBUG] abs diff (-)    =", float((loss_minus - loss_pert).abs()))
+        # 
+        #     g_old = ((loss_plus - loss_minus) / (2 * self.args.zo_eps)).item()
+        #     g_new = ((loss_base - loss_pert) / (2 * self.args.zo_eps)).item()
+        #     print("[DEBUG] proj_grad old =", g_old)
+        #     print("[DEBUG] proj_grad new =", g_new)
+        #     print("[DEBUG] grad abs diff =", abs(g_old - g_new))
+        # 
+        #     # layer-wise check（这次对拍是严谨的：old_plus 对 new_base，old_minus 对 new_pert）
+        #     for name in targets:
+        #         if name in old_plus_out and name in old_minus_out and name in new_out:
+        #             plus_err = (old_plus_out[name] - new_out[name]["base"]).abs().mean().item()
+        #             plus_ref_err = ((old_plus_out[name] - new_out[name]["base"]) / old_plus_out[name]).abs().mean().item()
+        #             minus_err = (old_minus_out[name] - new_out[name]["pert"]).abs().mean().item()
+        #             minus_ref_err = ((old_minus_out[name] - new_out[name]["pert"]) / old_minus_out[name]).abs().mean().item()
+        #             print(f"[LAYER-CHECK] {name} plus_err={plus_err:.6e} plus_ref_err={plus_ref_err:.6e} minus_err={minus_err:.6e} minus_ref_err={minus_ref_err:.6e}", flush=True)
+        #         else:
+        #             print(f"[LAYER-CHECK] missing {name} (old_plus={name in old_plus_out}, old_minus={name in old_minus_out}, new={name in new_out})", flush=True)
+        
 
         # First function evaluation
         self.lowrank_zo_perturb_parameters(scaling_factor=1)

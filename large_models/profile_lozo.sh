@@ -15,7 +15,8 @@ conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 # 只覆盖 lozo.sh 里支持 ${VAR:-default} 的变量
 export LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"testprofile"}
 
-export MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-13b}
+# export MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-13b}
+export MODEL=${MODEL:-/lamport/shared/hzheng/workspace/model/opt-350m}
 
 export MODE=${MODE:-ft}     
 
@@ -28,6 +29,8 @@ export EVAL=${EVAL:-64}
 
 export STEPS=${STEPS:-50}
 export EVAL_STEPS=${EVAL_STEPS:-10}
+
+
 
 echo "LOG_DIR_PREFIX=$LOG_DIR_PREFIX"
 echo "MODEL=$MODEL"

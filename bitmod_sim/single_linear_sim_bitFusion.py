@@ -1,209 +1,436 @@
+import argparse
 import math
+from typing import Any, Dict, Optional, Sequence
 
-from accelerator import Accelerator
-from mem.mem_instance import MemoryInstance
-
-
-MODEL_NAME = "single_linear_bitfusion"
-LAYER_NAME = "single_linear"
-
-# INPUT_SHAPE is interpreted as [BT, Cin], where BT = batch_size * tokens_per_sample.
-INPUT_SHAPE = [1024, 1024]
-WEIGHT_SHAPE = [1024, 1024]
-
-# Bit Fusion paper:
-# - one Fusion Unit (FU) contains 16 BitBricks
-# - the FU spatially supports up to 8-bit operands in one cycle
-# - 16-bit support is obtained temporally over 4 cycles
-FUSION_UNIT_BITBRICKS = 16
-FUSION_BUFFER_ACCESS_BITS = 32
-FUSION_UNIT_AREA = 1394.0
-FUSION_UNIT_POWER_NW = 538.0
-BIT_FUSION_FREQ_MHZ = 500.0
-FUSION_UNIT_ENERGY = FUSION_UNIT_POWER_NW / BIT_FUSION_FREQ_MHZ
-
-IS_BIT_SERIAL = False
-PE_DP_SIZE = 1            # 在bitfusion里这个这是保留接口，不参与实际的cycle计算
-PE_ENERGY = FUSION_UNIT_ENERGY
-PE_AREA = FUSION_UNIT_AREA
-PE_ARRAY_DIM = [32, 16]    # bitfusion论文说512个FU，我们这里将整个array假定为32*16
-I_PREC = 16
-KV_PREC = 8     # 由于此代码仿真的是单层linear，这个attention计算的KV精度知识保留接口
-W_PREC = 4
-BATCH_SIZE = 16
-CXT_LEN = INPUT_SHAPE[0] // BATCH_SIZE
-IS_GENERATION = False
-
-W_SRAM_SIZE_KB = 56
-I_SRAM_SIZE_KB = 56
-SRAM_READ_PJ_PER_BIT = 0.15      # 读写能耗是模仿45nm 下 CACTI-P 估出来的量级
-SRAM_WRITE_PJ_PER_BIT = 0.20     # 读写能耗是模仿45nm 下 CACTI-P 估出来的量级
-DRAM_BANDWIDTH_BITS = 128
+from single_linear_sim import (
+    SingleLinearSimulator,
+    _build_argparser as _build_base_argparser,
+    _ensure_supported_runtime,
+    _print_summary as _print_base_summary,
+    get_default_bitmod_config,
+)
 
 
-class SingleLinearBitFusionAccelerator(Accelerator):
-    SUPPORTED_PRECISIONS = (2, 4, 8, 16)
-    BITBRICKS_PER_FU = FUSION_UNIT_BITBRICKS
-    BUFFER_ACCESS_BITS = FUSION_BUFFER_ACCESS_BITS
+DEFAULT_OUTPUT_PRECISION_BITS = 16
+DEFAULT_BASE_ACTIVATION_PRECISION_BITS = 16
+DEFAULT_BASE_WEIGHT_PRECISION_BITS = 16
 
-    def _init_model_profiler(self, model_name, cxt_len=256, is_generation=False):
-        bt, cin = INPUT_SHAPE
-        cout, weight_cin = WEIGHT_SHAPE
-        assert cin == weight_cin
-        assert bt % self.batch_size == 0, "INPUT_SHAPE[0] must equal batch_size * tokens_per_sample."
 
-        num_token = bt // self.batch_size
-        self.weight_dim = {LAYER_NAME: [1, cout, cin]}
-        self.input_dim = {LAYER_NAME: [self.batch_size, num_token, cin]}
-        self.output_dim = {LAYER_NAME: [self.batch_size, num_token, cout]}
-        self.layer_name_list = [LAYER_NAME]
-    
-    # BitFusion 只支持 24 8 16 的混合精度乘法
-    def _round_to_supported_precision(self, precision):
-        requested_precision = max(2, math.ceil(precision))
-        for supported_precision in self.SUPPORTED_PRECISIONS:
-            if requested_precision <= supported_precision:
-                return supported_precision
-        raise ValueError(
-            f"Bit Fusion in this simulator only supports precisions up to "
-            f"{self.SUPPORTED_PRECISIONS[-1]} bits, got {precision}."
+def get_default_bitmodbb_config(
+    batch_size: int = 1,
+    cxt_len: int = 256,
+    is_generation: bool = False,
+    is_lossless: bool = False,
+    output_prec: float = DEFAULT_OUTPUT_PRECISION_BITS,
+) -> Dict[str, Any]:
+    config = get_default_bitmod_config(
+        batch_size=batch_size,
+        cxt_len=cxt_len,
+        is_generation=is_generation,
+        is_lossless=is_lossless,
+    )
+    config["OUTPUT_PREC"] = output_prec
+    config["BASE_ACTIVATION_PREC"] = DEFAULT_BASE_ACTIVATION_PRECISION_BITS
+    config["BASE_WEIGHT_PREC"] = DEFAULT_BASE_WEIGHT_PRECISION_BITS
+    return config
+
+
+class SingleLinearSimulatorBB(SingleLinearSimulator):
+    """
+    A `single_linear_sim` variant with two explicit modeling changes:
+
+    1. Output precision is modeled separately from input precision. By default
+       the output is bf16 (16 bits), which better matches mx_linear-style use.
+    2. In non-bit-serial mode, lower precisions increase effective throughput
+       using a simple BitFusion-like packing model around a base 8b x 8b FU.
+
+    Modeling assumption for non-bit-serial mode:
+        One FU is fully occupied by one (base_activation_prec x base_weight_prec)
+        MAC per cycle. If runtime precisions are smaller, multiple independent
+        MAC lanes can be packed into the same FU proportionally. If runtime
+        precisions are larger, the same work consumes more FU capacity and
+        throughput drops proportionally.
+
+    This is intentionally a coarse throughput model. It does not attempt to
+    capture packing fragmentation, alignment losses, or array remapping limits.
+    """
+
+    def __init__(
+        self,
+        x: Any,
+        w: Any,
+        bias: Optional[Any] = None,
+        i_prec: float = 16,
+        kv_prec: float = 8,
+        w_prec: float = 8,
+        output_prec: float = DEFAULT_OUTPUT_PRECISION_BITS,
+        batch_size: int = 1,
+        is_bit_serial: bool = False,
+        pe_dp_size: int = 1,  # 考虑到这个以bit为level， 一个FU处理的是8bit*8bit的GEMM， 按照一个16*16为一个点积，本来应该是0.25；我们这里按照一个FU有8*8个BB来仿。
+        pe_energy: float = 0,
+        pe_area: float = 0,
+        pe_array_dim: Sequence[int] = (),
+        init_mem: bool = True,
+        cxt_len: int = 256,
+        is_generation: bool = False,
+        layer_name: str = "single_linear",
+        base_activation_prec: float = DEFAULT_BASE_ACTIVATION_PRECISION_BITS,
+        base_weight_prec: float = DEFAULT_BASE_WEIGHT_PRECISION_BITS,
+    ):
+        self.output_prec = self._validate_positive_precision(output_prec, "output_prec")
+        self.base_activation_prec = self._validate_positive_precision(
+            base_activation_prec, "base_activation_prec"
+        )
+        self.base_weight_prec = self._validate_positive_precision(
+            base_weight_prec, "base_weight_prec"
+        )
+        self._layer_effective_parallelism = {}
+
+        super().__init__(
+            x=x,
+            w=w,
+            bias=bias,
+            i_prec=i_prec,
+            kv_prec=kv_prec,
+            w_prec=w_prec,
+            batch_size=batch_size,
+            is_bit_serial=is_bit_serial,
+            pe_dp_size=pe_dp_size,
+            pe_energy=pe_energy,
+            pe_area=pe_area,
+            pe_array_dim=pe_array_dim,
+            init_mem=False,
+            cxt_len=cxt_len,
+            is_generation=is_generation,
+            layer_name=layer_name,
         )
 
-    def _weight_precision_for_layer(self, layer_name):
+        self.mem_initialized = False
+        if init_mem:
+            _ensure_supported_runtime()
+            self._init_mem()
+            self._check_layer_mem_size()
+            self._calc_num_mem_refetch()
+            self.mem_initialized = True
+
+    @staticmethod
+    def _validate_positive_precision(precision: float, name: str) -> float:
+        precision = float(precision)
+        if precision <= 0:
+            raise ValueError(f"{name} must be > 0, but got {precision}.")
+        return precision
+
+    def _get_weight_precision(self, layer_name: str) -> float:
         if ("attn_qk" in layer_name) or ("attn_v" in layer_name):
-            return self.kv_prec
-        return self.w_prec
-    
-    # 将乘法递归分解成 2-bit 基本乘法 （bitbricks）
-    def _macs_per_fu_per_cycle(self, input_precision, weight_precision):
-        input_chunks = math.ceil(input_precision / 2)
-        weight_chunks = math.ceil(weight_precision / 2)
-        bitbrick_groups_per_mac = input_chunks * weight_chunks
-        return self.BITBRICKS_PER_FU / bitbrick_groups_per_mac
+            return float(self.kv_prec)
+        return float(self.w_prec)
+
+    def _get_output_precision(self, layer_name: str) -> float:
+        del layer_name
+        return float(self.output_prec)
+
+    def get_precision_speedup(self, activation_prec: float, weight_prec: float) -> float:
+        """
+        Return the idealized non-bit-serial throughput scaling relative to a
+        base FU that performs one (base_activation_prec x base_weight_prec) MAC
+        per cycle.
+
+        Example with the default base (8b x 8b):
+            8 x 8 -> 1x
+            8 x 4 -> 2x
+            4 x 4 -> 4x
+            2 x 2 -> 16x
+
+        For precisions above the base, the returned factor is < 1, meaning the
+        same work takes proportionally more cycles.
+        """
+
+        activation_prec = self._validate_positive_precision(
+            activation_prec, "activation_prec"
+        )
+        weight_prec = self._validate_positive_precision(weight_prec, "weight_prec")
+
+        activation_lane_scaling = self.base_activation_prec / activation_prec
+        weight_lane_scaling = self.base_weight_prec / weight_prec
+        return activation_lane_scaling * weight_lane_scaling
+
+    def get_effective_parallelism(self, layer_name: str) -> float:
+        if self.is_bit_serial:
+            return 1.0
+        return self.get_precision_speedup(
+            activation_prec=float(self.i_prec),
+            weight_prec=self._get_weight_precision(layer_name),
+        )
 
     def _calc_compute_cycle(self):
         self._layer_cycle_compute = {}
-        input_precision = self._round_to_supported_precision(self.i_prec)
+        self._layer_effective_parallelism = {}
+        for name in self.layer_name_list:
+            w_dim = self.weight_dim[name]
+            o_dim = self.output_dim[name]
+            if ("attn_qk" in name) or ("attn_v" in name):
+                pe_latency = self.pe_latency["attn"]
+            else:
+                pe_latency = self.pe_latency["linear"]
+
+            if w_dim is None:
+                continue
+
+            tile_layer = self._calc_tile_fc(w_dim, o_dim)
+            effective_parallelism = self.get_effective_parallelism(name)
+            cycle_layer_compute = math.ceil(tile_layer * pe_latency / effective_parallelism)
+
+            self._layer_effective_parallelism[name] = effective_parallelism
+            self._layer_cycle_compute[name] = max(1, int(cycle_layer_compute))
+
+    def _check_layer_mem_size(self):
+        self._w_mem_required = {}
+        self._i_mem_required = {}
+        self._o_mem_required = {}
 
         for name in self.layer_name_list:
-            _, cout, cin = self.weight_dim[name]
-            batch_size, num_token, _ = self.output_dim[name]
-            weight_precision = self._round_to_supported_precision(self._weight_precision_for_layer(name))
+            i_prec = float(self.i_prec)
+            o_prec = self._get_output_precision(name)
+            w_prec = self._get_weight_precision(name)
 
-            total_mac = batch_size * num_token * cout * cin
-            total_parallel_mac_per_cycle = (
-                self.total_pe_count * self._macs_per_fu_per_cycle(input_precision, weight_precision)
+            w_dim = self.weight_dim[name]
+            i_dim = self.input_dim[name]
+            o_dim = self.output_dim[name]
+
+            batch_kv, cout_w, cin_w = w_dim
+            batch_size_in, num_token_in, cin_i = i_dim
+            batch_size_out, num_token_out, cin_o = o_dim
+
+            assert cin_w == cin_i, (
+                f"The last dimension of weight and input matrices, {cin_w} and {cin_i}, "
+                "do not match."
             )
-            self._layer_cycle_compute[name] = math.ceil(total_mac / total_parallel_mac_per_cycle)
+            assert cout_w == cin_o, (
+                f"The output dimension of weight and output matrices, {cout_w} and {cin_o}, "
+                "do not match."
+            )
+            assert num_token_in == num_token_out, (
+                f"The num_token of input and output matrices, {num_token_in} and {num_token_out}, "
+                "do not match."
+            )
+            assert batch_size_in == batch_size_out, (
+                f"The batch_size of input and output matrices, {batch_size_in} and {batch_size_out}, "
+                "do not match."
+            )
 
-    def calc_sram_rd_energy(self):
-        total_energy = 0
-        for name in self.layer_name_list:
-            num_fetch_w, num_fetch_i = self._layer_mem_refetch[name]
-            w_access = math.ceil(self._w_mem_required[name] * 8 / self.w_sram.rw_bw) * num_fetch_w
-            i_access = math.ceil(self._i_mem_required[name] * 8 / self.i_sram.rw_bw) * num_fetch_i
-            total_energy += w_access * self.w_sram.r_cost
-            total_energy += i_access * self.i_sram.r_cost
-        return total_energy
+            self._w_mem_required[name] = math.ceil(cin_w * w_prec / 8) * cout_w * batch_kv
+            self._i_mem_required[name] = (
+                math.ceil(cin_i * i_prec / 8) * num_token_in * batch_size_in
+            )
+            self._o_mem_required[name] = (
+                math.ceil(cin_o * o_prec / 8) * num_token_out * batch_size_out
+            )
 
-    def _init_mem(self):
-        w_bandwidth = self.BUFFER_ACCESS_BITS * self.pe_array_dim["h"]
-        i_bandwidth = self.BUFFER_ACCESS_BITS * self.pe_array_dim["w"]
-        w_sram_config = {
-            "technology": 0.045,
-            "mem_type": "ram",
-            "size": W_SRAM_SIZE_KB * 1024 * 8,
-            "bank_count": 8,
-            "rw_bw": w_bandwidth,
-            "r_port": 1,
-            "w_port": 1,
-            "rw_port": 0,
-        }
-        self.w_sram = MemoryInstance(
-            w_sram_config,
-            r_cost=w_bandwidth * SRAM_READ_PJ_PER_BIT,
-            w_cost=w_bandwidth * SRAM_WRITE_PJ_PER_BIT,
-            latency=1,
-            min_r_granularity=self.BUFFER_ACCESS_BITS,
-            min_w_granularity=self.BUFFER_ACCESS_BITS,
-            get_cost_from_cacti=False,
+    def _calc_sram_wr_energy_fc(self, layer_name):
+        w_dim = self.weight_dim[layer_name]
+        i_dim = self.input_dim[layer_name]
+        o_dim = self.output_dim[layer_name]
+
+        i_prec = float(self.i_prec)
+        o_prec = self._get_output_precision(layer_name)
+        w_prec = self._get_weight_precision(layer_name)
+
+        w_sram_wr_cost = self.w_sram.w_cost_min
+        i_sram_wr_cost = self.i_sram.w_cost_min
+        w_sram_min_wr_bw = self.w_sram.w_bw_min
+        i_sram_min_wr_bw = self.i_sram.w_bw_min
+        num_fetch_w, num_fetch_i = self._layer_mem_refetch[layer_name]
+
+        batch_kv, cout_w, cin_w = w_dim
+        batch_size_in, num_token_in, cin_i = i_dim
+        batch_size_out, num_token_out, cin_o = o_dim
+
+        num_w_sram_wr = math.ceil(cin_w * w_prec / w_sram_min_wr_bw) * cout_w * batch_kv
+        energy_w_sram_wr = num_w_sram_wr * w_sram_wr_cost * num_fetch_w
+        num_i_sram_wr = (
+            math.ceil(cin_i * i_prec / i_sram_min_wr_bw) * num_token_in * batch_size_in
         )
-
-        i_sram_config = {
-            "technology": 0.045,
-            "mem_type": "ram",
-            "size": I_SRAM_SIZE_KB * 1024 * 8,
-            "bank_count": 8,
-            "rw_bw": i_bandwidth,
-            "r_port": 1,
-            "w_port": 1,
-            "rw_port": 0,
-        }
-        self.i_sram = MemoryInstance(
-            i_sram_config,
-            r_cost=i_bandwidth * SRAM_READ_PJ_PER_BIT,
-            w_cost=i_bandwidth * SRAM_WRITE_PJ_PER_BIT,
-            latency=1,
-            min_r_granularity=self.BUFFER_ACCESS_BITS,
-            min_w_granularity=self.BUFFER_ACCESS_BITS,
-            get_cost_from_cacti=False,
+        energy_i_sram_wr = num_i_sram_wr * i_sram_wr_cost * num_fetch_i
+        num_o_sram_wr = (
+            math.ceil(cin_o * o_prec / i_sram_min_wr_bw) * num_token_out * batch_size_out
         )
+        energy_o_sram_wr = num_o_sram_wr * i_sram_wr_cost
 
-        dram_config = {
-            "technology": 0.045,
-            "mem_type": "dram",
-            "size": int(1e9 * 8),
-            "bank_count": 1,
-            "rw_bw": DRAM_BANDWIDTH_BITS,
-            "r_port": 0,
-            "w_port": 0,
-            "rw_port": 1,
+        return energy_w_sram_wr + energy_i_sram_wr + energy_o_sram_wr
+
+    def collect_modeling_snapshot(self) -> Dict[str, Any]:
+        """
+        Gather a small set of stats that do not require SRAM/DRAM initialization.
+        This is useful for quick sanity checks on precision scaling trends.
+        """
+
+        self._check_layer_mem_size()
+        self._calc_compute_cycle()
+        layer_name = self.layer_name_list[0]
+        return {
+            "layer_name": layer_name,
+            "compute_cycles": self._layer_cycle_compute[layer_name],
+            "tile_count": self._calc_tile_fc(
+                self.weight_dim[layer_name], self.output_dim[layer_name]
+            ),
+            "precision_bits": {
+                "input": float(self.i_prec),
+                "weight": self._get_weight_precision(layer_name),
+                "output": self._get_output_precision(layer_name),
+            },
+            "effective_parallelism": self._layer_effective_parallelism[layer_name],
+            "memory_bytes": {
+                "weight": self._w_mem_required[layer_name],
+                "input": self._i_mem_required[layer_name],
+                "output": self._o_mem_required[layer_name],
+            },
         }
-        dram_cost = DRAM_BANDWIDTH_BITS / 64 * 1200
-        self.dram = MemoryInstance(
-            dram_config,
-            r_cost=dram_cost,
-            w_cost=dram_cost,
-            latency=1,
-            min_r_granularity=DRAM_BANDWIDTH_BITS,
-            min_w_granularity=DRAM_BANDWIDTH_BITS,
-            get_cost_from_cacti=False,
-        )
+
+    def simulate(self) -> Dict[str, Any]:
+        result = super().simulate()
+        layer_name = self.layer_name_list[0]
+        result["precision_bits"] = {
+            "input": float(self.i_prec),
+            "weight": self._get_weight_precision(layer_name),
+            "output": self._get_output_precision(layer_name),
+        }
+        result["compute_model"] = {
+            "is_bit_serial": self.is_bit_serial,
+            "base_activation_prec": self.base_activation_prec,
+            "base_weight_prec": self.base_weight_prec,
+            "effective_parallelism": self._layer_effective_parallelism.get(
+                layer_name, self.get_effective_parallelism(layer_name)
+            ),
+        }
+        return result
 
 
-SingleLinearAccelerator = SingleLinearBitFusionAccelerator
+def _build_argparser() -> argparse.ArgumentParser:
+    parser = _build_base_argparser()
+    parser.description = (
+        "single_linear_simBB: explicit output precision plus BitFusion-like "
+        "precision-sensitive throughput for non-bit-serial mode."
+    )
+    parser.add_argument(
+        "--output_prec",
+        type=float,
+        default=DEFAULT_OUTPUT_PRECISION_BITS,
+        help="Output precision in bits. Default is bf16 = 16.",
+    )
+    parser.add_argument(
+        "--base_activation_prec",
+        type=float,
+        default=DEFAULT_BASE_ACTIVATION_PRECISION_BITS,
+        help="Base activation precision used by the non-bit-serial FU model.",
+    )
+    parser.add_argument(
+        "--base_weight_prec",
+        type=float,
+        default=DEFAULT_BASE_WEIGHT_PRECISION_BITS,
+        help="Base weight precision used by the non-bit-serial FU model.",
+    )
+    parser.add_argument(
+        "--sanity_check",
+        action="store_true",
+        help="Run a minimal trend check without initializing CACTI memories.",
+    )
+    return parser
+
+
+def _print_summary(result: Dict[str, Any]) -> None:
+    _print_base_summary(result)
+    precision_bits = result.get("precision_bits", {})
+    if precision_bits:
+        print(f"precision bits:    {precision_bits}")
+
+    compute_model = result.get("compute_model", {})
+    if compute_model:
+        print(f"compute model:     {compute_model}")
+
+
+def run_minimal_sanity_check() -> Dict[str, Dict[str, Any]]:
+    common_kwargs = {
+        "x": (1, 64, 128),
+        "w": (256, 128),
+        "output_prec": DEFAULT_OUTPUT_PRECISION_BITS,
+        "batch_size": 1,
+        "is_bit_serial": False,
+        "pe_dp_size": 4,
+        "pe_energy": 0.56,
+        "pe_area": 1507.7,
+        "pe_array_dim": (32, 32),
+        "init_mem": False,
+        "cxt_len": 64,
+        "is_generation": False,
+        "base_activation_prec": DEFAULT_BASE_ACTIVATION_PRECISION_BITS,
+        "base_weight_prec": DEFAULT_BASE_WEIGHT_PRECISION_BITS,
+    }
+
+    sim_8x8 = SingleLinearSimulatorBB(i_prec=8, w_prec=8, **common_kwargs)
+    sim_4x4 = SingleLinearSimulatorBB(i_prec=4, w_prec=4, **common_kwargs)
+
+    return {
+        "8x8": sim_8x8.collect_modeling_snapshot(),
+        "4x4": sim_4x4.collect_modeling_snapshot(),
+    }
+
+
+def _print_sanity_check(result: Dict[str, Dict[str, Any]]) -> None:
+    stat_8x8 = result["8x8"]
+    stat_4x4 = result["4x4"]
+
+    for label in ("8x8", "4x4"):
+        stat = result[label]
+        print(f"{label} precision snapshot:")
+        print(f"  compute cycles:         {stat['compute_cycles']}")
+        print(f"  effective parallelism:  {stat['effective_parallelism']}")
+        print(f"  memory bytes:           {stat['memory_bytes']}")
+
+    print("sanity trend:")
+    print(f"  8x8 slower than 4x4:    {stat_8x8['compute_cycles'] > stat_4x4['compute_cycles']}")
+    print(
+        "  output bytes stay bf16: "
+        f"{stat_8x8['memory_bytes']['output']} == {stat_4x4['memory_bytes']['output']}"
+    )
 
 
 if __name__ == "__main__":
-    acc = SingleLinearBitFusionAccelerator(
-        model_name=MODEL_NAME,
-        i_prec=I_PREC,
-        kv_prec=KV_PREC,
-        w_prec=W_PREC,
-        batch_size=BATCH_SIZE,
-        is_bit_serial=IS_BIT_SERIAL,
-        pe_dp_size=PE_DP_SIZE,
-        pe_energy=PE_ENERGY,
-        pe_area=PE_AREA,
-        pe_array_dim=PE_ARRAY_DIM,
-        cxt_len=CXT_LEN,
-        is_generation=IS_GENERATION,
-    )
+    parser = _build_argparser()
+    args = parser.parse_args()
 
-    total_cycle = acc.calc_cycle()
-    compute_energy = acc.calc_compute_energy() / 1e6
-    sram_rd_energy = acc.calc_sram_rd_energy() / 1e6
-    sram_wr_energy = acc.calc_sram_wr_energy() / 1e6
-    dram_energy = acc.calc_dram_energy() / 1e6
-    total_energy = compute_energy + sram_rd_energy + sram_wr_energy + dram_energy
+    if args.sanity_check:
+        _print_sanity_check(run_minimal_sanity_check())
+    else:
+        bitmod_cfg = get_default_bitmodbb_config(
+            batch_size=args.batch_size,
+            cxt_len=args.cxt_len,
+            is_generation=args.is_generation,
+            is_lossless=args.is_lossless,
+            output_prec=args.output_prec,
+        )
 
-    print(f"batch_size: {BATCH_SIZE}")
-    print(f"tokens_per_sample: {INPUT_SHAPE[0] // BATCH_SIZE}")
-    print(f"fusion_units: {PE_ARRAY_DIM[0] * PE_ARRAY_DIM[1]}")
-    print(f"total_cycle: {total_cycle}")
-    print(f"compute_energy: {compute_energy} uJ")
-    print(f"sram_rd_energy: {sram_rd_energy} uJ")
-    print(f"sram_wr_energy: {sram_wr_energy} uJ")
-    print(f"dram_energy: {dram_energy} uJ")
-    print(f"total_energy: {total_energy} uJ")
+        if args.is_generation:
+            x = (1, bitmod_cfg["BATCH_SIZE"], args.in_features)
+        else:
+            x = (bitmod_cfg["BATCH_SIZE"], bitmod_cfg["CXT_LEN"], args.in_features)
+        w = (args.out_features, args.in_features)
 
+        sim = SingleLinearSimulatorBB(
+            x=x,
+            w=w,
+            i_prec=bitmod_cfg["I_PREC"],
+            kv_prec=bitmod_cfg["KV_PREC"],
+            w_prec=bitmod_cfg["W_PREC"],
+            output_prec=bitmod_cfg["OUTPUT_PREC"],
+            batch_size=bitmod_cfg["BATCH_SIZE"],
+            is_bit_serial=bitmod_cfg["IS_BIT_SERIAL"],
+            pe_dp_size=bitmod_cfg["PE_DP_SIZE"],
+            pe_energy=bitmod_cfg["PE_ENERGY"],
+            pe_area=bitmod_cfg["PE_AREA"],
+            pe_array_dim=bitmod_cfg["PE_ARRAY_DIM"],
+            cxt_len=bitmod_cfg["CXT_LEN"],
+            is_generation=bitmod_cfg["IS_GENERATION"],
+            base_activation_prec=args.base_activation_prec,
+            base_weight_prec=args.base_weight_prec,
+        )
+        _print_summary(sim.simulate())

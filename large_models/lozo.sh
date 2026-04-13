@@ -20,11 +20,12 @@ export TRANSFORMERS_OFFLINE=1
 source ~/.bashrc
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=7
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
-MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-13b}
+# MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-13b}
+MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-6.7b}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
@@ -46,8 +47,8 @@ elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
 
-LR=1e-7
-TASK=Copa
+LR=2e-7
+TASK=ReCoRD
 SEED=0
 RANK=2
 STEP_INTERVAL=100
@@ -61,7 +62,7 @@ ENABLE_W=${ENABLE_W:-true}
 ENABLE_DIFFW=${ENABLE_DIFFW:-true}
 MX_A_ELEM_FORMAT=${MX_A_ELEM_FORMAT:-"fp8_e4m3"}
 MX_DIFFA_ELEM_FORMAT=${MX_DIFFA_ELEM_FORMAT:-"fp4_e2m1"}
-MX_W_ELEM_FORMAT=${MX_W_ELEM_FORMAT:-"fp4_e2m1"}
+MX_W_ELEM_FORMAT=${MX_W_ELEM_FORMAT:-"fp8_e4m3"}
 MX_DIFFW_ELEM_FORMAT=${MX_DIFFW_ELEM_FORMAT:-"fp4_e2m1"}
 
 TRAINABLE_MODE=${TRAINABLE_MODE:-"all"}
@@ -110,6 +111,8 @@ else
     ENABLE="normal-${TRAINABLE_MODE}"
 fi
 
+ENABLE="${ENABLE}"
+
 echo "Quantize pattern: $ENABLE"
 
 # 创建日志目录
@@ -135,7 +138,7 @@ echo "apply_forward_delta": "$APPLY_FORWARD_DELTA"
 python run_lozo.py \
     --model_name $MODEL_NAME --model_path $MODEL\
     --task_name $TASK \
-    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+    --output_dir result/$TASK-${MODEL_NAME}-$TAG-${ENABLE} --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
     --max_steps $STEPS \
     --trainer $Tainer --load_float16 \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \

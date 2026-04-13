@@ -16,22 +16,24 @@ export TQDM_DISABLE=1
 
 FEW_SHOT_TYPE=${FEW_SHOT_TYPE:-"prompt"}
 
-TASK=${TASK:-SST-2}
+TASK=${TASK:-sst-5}
 K=${K:-512}
 SEED=${SEED:-42}
 BS=${BS:-64}
-LR=${LR:-1e-6}
+LR=${LR:-2e-7}
 EPS=${EPS:-1e-3}
 WD=${WD:-0}
-STEP=${STEP:-20000}
-EVAL_STEP=${EVAL_STEP:-500}
+STEP=${STEP:-100000}
+EVAL_STEP=${EVAL_STEP:-1000}
 STEP_INTERVAL=${STEP_INTERVAL:-50}
 RANK=${RANK:-8}
 LOZO_OPTIMIZER=${LOZO_OPTIMIZER:-'sgd'}
 BETA1=${BETA1:-0.9}
 MODEL=${MODEL:-"/lamport/shared/hzheng/workspace/model/roberta-large"}
+# MODEL=${MODEL:-"/lamport/shared/hzheng/workspace/model/opt-350m"}
 MODELNAME=${MODELNAME:-"roberta-large"}
-LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"test_mx_new/mx166"}
+# MODELNAME=${MODELNAME:-"opt"}
+LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"test_mx_new/mx168"}
 
 
 # lora参数
@@ -59,15 +61,15 @@ WEIGHT_BIT=${WEIGHT_BIT:-4}
 
 # ----------------- Here! ------------------
 # forward_delta 
-APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-true}
+APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-false}
 ENABLE_X=${ENABLE_X:-true}
 ENABLE_DIFFX=${ENABLE_DIFFX:-true}
 ENABLE_W=${ENABLE_W:-true}
 ENABLE_DIFFW=${ENABLE_DIFFW:-true}
 MX_A_ELEM_FORMAT=${MX_A_ELEM_FORMAT:-"fp8_e4m3"}
-MX_DIFFA_ELEM_FORMAT=${MX_DIFFA_ELEM_FORMAT:-"int2"}
-MX_W_ELEM_FORMAT=${MX_W_ELEM_FORMAT:-"fp4_e2m1"}
-MX_DIFFW_ELEM_FORMAT=${MX_DIFFW_ELEM_FORMAT:-"fp4_e2m1"}
+MX_DIFFA_ELEM_FORMAT=${MX_DIFFA_ELEM_FORMAT:-"fp4_e2m1"}
+MX_W_ELEM_FORMAT=${MX_W_ELEM_FORMAT:-"fp8_e4m3"}
+MX_DIFFW_ELEM_FORMAT=${MX_DIFFW_ELEM_FORMAT:-"fp8_e4m3"}
 
 TRAINABLE_MODE=${TRAINABLE_MODE:-"all"}
 
@@ -140,6 +142,6 @@ TYPE=$FEW_SHOT_TYPE GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED 
     --apply_forward_delta $APPLY_FORWARD_DELTA --use_forward_delta_loss $APPLY_FORWARD_DELTA\
     --load_best_model_at_end True --evaluation_strategy steps --save_strategy steps --save_total_limit 1 --evaluate_during_training $EVALUATE_DURING_TRAINING\
     --save_steps $EVAL_STEP \
-    --debug_forward_delta --debug_forward_delta_steps 5 --debug_forward_delta_tol 1e-6 --debug_forward_delta_abort False \
+    --debug_forward_delta --debug_forward_delta_steps 10 --debug_forward_delta_tol 1e-6 --debug_forward_delta_abort False \
     --compare_seed --compare_seed_steps 30 \
     $@

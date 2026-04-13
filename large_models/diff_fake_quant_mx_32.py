@@ -16,7 +16,8 @@ except Exception as e:
     raise ImportError(
         "microxcaling 未安装或不可用。请先 `pip install microxcaling` 并确保有 CUDA 环境。"
     ) from e
-               
+            
+   
 class diffLinear(nn.Linear):
     def __init__(
         self,
@@ -33,48 +34,60 @@ class diffLinear(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input)
     
-    def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor) -> torch.Tensor:
+    def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor):
         self.inference_count += 1
-        # ground state output
+    
+        # base path
         output = F.linear(input, self.weight, self.bias)
-        
-        # calculate diff_weight_output
-        diff_weight_output = 0
+    
+        # fp32 diff path
+        input_fp32 = input.float()
+        diff_input_fp32 = diff_input.float()
+        weight_fp32 = self.weight.float()
+    
+        # W * diff_x
+        diff_output = F.linear(diff_input_fp32, weight_fp32, None)
+    
         if self.uv_provider is not None:
-            u, v, scale = self.uv_provider(self.layer_name + ".weight",
-                               self.weight.shape,
-                               self.weight.device,
-                               self.weight.dtype,
-                               self.inference_count)
-            # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_u[0]:{u[0]}, fake_v[0]:{v[0]}")
-            tmp = F.linear(input, v.t(), None)
-            diff_weight_output = F.linear(tmp, u, None)
-            diff_weight_output = diff_weight_output * scale
-        
-        diff_bias = 0
+            param_name = self.layer_name + ".weight" if self.layer_name else "weight"
+            u, v, scale = self.uv_provider(
+                param_name,
+                self.weight.shape,
+                self.weight.device,
+                self.weight.dtype,
+                self.inference_count
+            )
+    
+            u = u.float()
+            v = v.float()
+            scale = float(scale)
+    
+            out_dim = diff_output.size(-1)
+            diff_out_2d = diff_output.reshape(-1, out_dim)
+    
+            # ΔW Δx
+            tmp = diff_input_fp32.reshape(-1, v.size(0)).matmul(v)
+            diff_out_2d.addmm_(tmp, u.t(), beta=1.0, alpha=scale)
+    
+            # ΔW x
+            tmp = input_fp32.reshape(-1, v.size(0)).matmul(v)
+            diff_out_2d.addmm_(tmp, u.t(), beta=1.0, alpha=scale)
+    
+            diff_output = diff_out_2d.view_as(diff_output)
+    
         if self.z_provider is not None and (self.bias is not None):
+            param_name = self.layer_name + ".bias" if self.layer_name else "bias"
             z, bias_scale = self.z_provider(
-                self.layer_name + ".bias",
+                param_name,
                 self.bias.shape,
                 self.bias.device,
                 self.bias.dtype,
-                self.inference_count,
+                self.inference_count
             )
-            # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z[0]:{z[0]}")
-            diff_bias = bias_scale * z
-            view_shape = [1] * output.dim()
-            view_shape[-1] = diff_bias.size(0)
-            diff_bias = diff_bias.view(*view_shape)
-            diff_bias = diff_bias.expand_as(output)
-        
-        # calculate diff_act_output
-        diff_act_output = F.linear(diff_input, self.weight, None)
-        tmp = F.linear(diff_input, v.t(), None)   # [*, r]
-        cross = F.linear(tmp, u, None) * scale    # [*, out]
-        diff_act_output = diff_act_output + cross
-        
-        diff_output = diff_act_output + diff_weight_output + diff_bias
-        
+            diff_bias = z.float() * float(bias_scale)
+            view_shape = [1] * (diff_output.dim() - 1) + [-1]
+            diff_output.add_(diff_bias.view(*view_shape))
+    
         return output, diff_output
     
     
@@ -159,10 +172,6 @@ class QdiffLinear(nn.Linear):
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor) -> torch.Tensor:
         self.inference_count += 1
-        
-        # if self.inference_count == 2:
-        #     print(f"input:{input.shape}; layername:{self.layer_name}")
-        
         # ground state output
         output = mx_linear(input, self.weight, self.bias, mx_specs=self.mx_specs0)
         
@@ -238,21 +247,18 @@ class diffEmbedding(nn.Embedding):
     def forward(self, input: torch.LongTensor) -> torch.Tensor:
         return super().forward(input)           
     
-    def forward_delta(self, input):  
+    def forward_delta(self, input):
         self.inference_count += 1
-        # ground state output
-        output = super().forward(input)  # [B, T, C]
-        
-        # calculate uv-diff part
+        output = super().forward(input)   
+    
         if self.uv_provider is None:
-            diff_output = torch.zeros_like(output)
+            diff_output = torch.zeros(
+                output.shape, device=output.device, dtype=torch.float32
+            )
             return output, diff_output
-        weight = self.weight                     # [num_embeddings, embedding_dim]
-        num_embeddings, dim = weight.shape
-        if self.layer_name:
-            param_name = self.layer_name + ".weight"
-        else:
-            param_name = "weight"  # fallback，
+    
+        weight = self.weight
+        param_name = self.layer_name + ".weight" if self.layer_name else "weight"
         u, v, scale = self.uv_provider(
             param_name,
             weight.shape,
@@ -260,10 +266,12 @@ class diffEmbedding(nn.Embedding):
             weight.dtype,
             self.inference_count,
         )
-        # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_u[0]:{u[0]}, fake_v[0]:{v[0]}")
-        u_rows = u[input]                      # [B, T, r]
-        diff_output = torch.matmul(u_rows, v.t()) * scale
-        
+    
+        u_rows = u[input].float()
+        v = v.float()
+        scale = float(scale)
+    
+        diff_output = torch.matmul(u_rows, v.t()) * scale   # fp32
         return output, diff_output
         
     def __repr__(self) -> str:
@@ -290,44 +298,53 @@ class diffLayerNorm(nn.LayerNorm):
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor):
         self.inference_count += 1
-        # ground state output
+    
+        # base path
         output = super().forward(input)
-        
-        input_1 = input + diff_input
+    
+        # pert path in fp32
+        input_1 = input.float() + diff_input.float()
+    
         if self.elementwise_affine:
             weight = self.weight
             bias = self.bias
         else:
             weight = None
             bias = None
-        weight_1 = weight
-        bias_1 = bias
+    
+        weight_1 = weight.float() if weight is not None else None
+        bias_1 = bias.float() if bias is not None else None
+    
         if self.z_provider is not None and self.elementwise_affine:
             if weight is not None:
-                w_name = self.layer_name + ".weight" if self.layer_name else "weight"
                 z_w, scale_w = self.z_provider(
-                    w_name,
+                    self.layer_name + ".weight" if self.layer_name else "weight",
                     weight.shape,
                     weight.device,
                     weight.dtype,
                     self.inference_count,
                 )
-                weight_1 = weight + z_w * scale_w  # γ_new = γ + Δγ
-                # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z_w[0]:{z_w[0]}")
+                weight_1 = weight.float() + z_w.float() * float(scale_w)
+    
             if bias is not None:
-                b_name = self.layer_name + ".bias" if self.layer_name else "bias"
                 z_b, scale_b = self.z_provider(
-                    b_name,
+                    self.layer_name + ".bias" if self.layer_name else "bias",
                     bias.shape,
                     bias.device,
                     bias.dtype,
                     self.inference_count,
                 )
-                bias_1 = bias + z_b * scale_b      # β_new = β + Δβ
-                # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z_b[0]:{z_b[0]}")
-        output_1 = F.layer_norm(input_1, self.normalized_shape, weight_1, bias_1, self.eps)
-        diff_output = output_1 - output
-        
+                bias_1 = bias.float() + z_b.float() * float(scale_b)
+    
+        output_1 = F.layer_norm(
+            input_1,
+            self.normalized_shape,
+            weight_1,
+            bias_1,
+            self.eps,
+        )
+    
+        diff_output = output_1 - output.float()
         return output, diff_output
             
 
@@ -382,10 +399,11 @@ def QuantizeRobertaForLOZO(
     def replace_roberta_module(module, prefix=""):
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
-            print(f"Checking layer: {full_name}")
+            # print(f"Checking layer: {full_name}")
 
             in_encoder = full_name.startswith("roberta.encoder")
             in_embeddings = full_name.startswith("roberta.embeddings")
+            
 
             if in_embeddings and isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
                 new_emb = diffEmbedding(
@@ -403,7 +421,7 @@ def QuantizeRobertaForLOZO(
                 )
                 new_emb.weight.data = child.weight.data.clone()
                 setattr(module, name, new_emb)
-                print(f"Replace {full_name} with diffEmbedding")
+                # print(f"Replace {full_name} with diffEmbedding")
                 continue
             
             # 别忘记这里应该是QdiffLinear
@@ -493,8 +511,8 @@ def QuantizeRobertaForLOZO(
         print(model)
     else:
         print("Model is not a RoBERTa model, skip QuantizeRobertaForLOZO.")
-        
-        
+
+
 def QuantizeOPTForLOZO(
     enable_w, enable_x, enable_diffw, enable_diffx,
     model: nn.Module,
@@ -509,6 +527,7 @@ def QuantizeOPTForLOZO(
 
             in_decoder_layers = full_name.startswith("model.decoder.layers")
             is_lm_head = (full_name == "lm_head")
+            is_proj_inout = full_name in ("model.decoder.project_in", "model.decoder.project_out")
             
             if child.__class__.__name__ == "OPTLearnedPositionalEmbedding":
                 child.layer_name = full_name
@@ -562,6 +581,24 @@ def QuantizeOPTForLOZO(
             #     continue
             
             if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+                new_head = diffLinear(
+                    layer_name=full_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",              
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_head.weight = child.weight
+                if child.bias is not None:
+                    new_head.bias = child.bias
+                setattr(module, name, new_head)
+                # print(f"Replace {full_name} with diffLinear (share params)")
+                continue
+            
+            if is_proj_inout and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
                 new_head = diffLinear(
                     layer_name=full_name,
                     in_features=child.in_features,

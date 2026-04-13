@@ -71,7 +71,7 @@ OPT_PRETRAINED_MODEL_ARCHIVE_LIST = [
     # See all OPT models at https://huggingface.co/models?filter=opt
 ]
 
-DEBUG_FP32_ATTN = False
+DEBUG_FP32_ATTN = True
 
 @dataclass
 class BaseModelOutputWithPastAndDiff(ModelOutput):
@@ -441,7 +441,11 @@ class OPTAttention(nn.Module):
         src_len = k.size(1)
 
         attn_scores = torch.bmm(q, k.transpose(1, 2))
-        attn_scores_1 = torch.bmm(q + dq, (k + dk).transpose(1, 2))
+        # pert branch: 显式 fp32
+        q_pert = q.float() + dq.float()
+        k_pert = k.float() + dk.float()
+        v_pert = v.float() + dv.float()
+        attn_scores_1 = torch.bmm(q_pert, k_pert.transpose(1, 2))
 
         if attn_scores.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -455,11 +459,13 @@ class OPTAttention(nn.Module):
                 )
 
             attn_scores = attn_scores.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-            attn_scores_1 = attn_scores_1.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
-
+            attn_scores_1 = attn_scores_1.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask.float()
+            
             min_val = torch.tensor(torch.finfo(attn_scores.dtype).min, device=attn_scores.device, dtype=attn_scores.dtype)
+            min_val_1 = torch.tensor(torch.finfo(attn_scores_1.dtype).min, device=attn_scores_1.device, dtype=attn_scores_1.dtype)
+            
             attn_scores = torch.max(attn_scores, min_val)
-            attn_scores_1 = torch.max(attn_scores_1, min_val)
+            attn_scores_1 = torch.max(attn_scores_1, min_val_1)
 
             attn_scores = attn_scores.view(bsz * self.num_heads, tgt_len, src_len)
             attn_scores_1 = attn_scores_1.view(bsz * self.num_heads, tgt_len, src_len)
@@ -495,17 +501,29 @@ class OPTAttention(nn.Module):
         # attn_output_1 = torch.bmm(attn_probs_1, v + dv)
         
         if DEBUG_FP32_ATTN:
-            attn_weights = nn.functional.softmax(attn_scores.float(), dim=-1)
-            attn_weights_1 = nn.functional.softmax(attn_scores_1.float(), dim=-1)
+            # base: 完全沿用原始逻辑
+            if attn_scores.dtype == torch.float16:
+                attn_weights = nn.functional.softmax(attn_scores, dim=-1, dtype=torch.float32).to(torch.float16)
+            else:
+                attn_weights = nn.functional.softmax(attn_scores, dim=-1)
+
+            # pert: 强制 fp32
+            attn_weights_1 = nn.functional.softmax(attn_scores_1, dim=-1, dtype=torch.float32)
         
             if layer_head_mask is not None:
                 if layer_head_mask.size() != (self.num_heads,):
                     raise ValueError(
                         f"Head mask for a single layer should be of size {(self.num_heads,)}, but is {layer_head_mask.size()}"
                     )
-                mh = layer_head_mask.view(1, -1, 1, 1).float()
-                attn_weights = (mh * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)).view(bsz * self.num_heads, tgt_len, src_len)
-                attn_weights_1 = (mh * attn_weights_1.view(bsz, self.num_heads, tgt_len, src_len)).view(bsz * self.num_heads, tgt_len, src_len)
+                mh_base = layer_head_mask.view(1, -1, 1, 1).to(attn_weights.dtype)
+                mh_pert = layer_head_mask.view(1, -1, 1, 1).float()
+                
+                attn_weights = (mh_base * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)).view(
+                    bsz * self.num_heads, tgt_len, src_len
+                )
+                attn_weights_1 = (mh_pert * attn_weights_1.view(bsz, self.num_heads, tgt_len, src_len)).view(
+                    bsz * self.num_heads, tgt_len, src_len
+                )
         
             if output_attentions:
                 attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
@@ -516,11 +534,8 @@ class OPTAttention(nn.Module):
             attn_probs = F.dropout(attn_weights, p=self.dropout, training=self.training)
             attn_probs_1 = F.dropout(attn_weights_1, p=self.dropout, training=self.training)
         
-            attn_output = torch.bmm(attn_probs, v.float())
-            attn_output_1 = torch.bmm(attn_probs_1, (v + dv).float())
-        
-            attn_output = attn_output.to(hidden_states.dtype)
-            attn_output_1 = attn_output_1.to(hidden_states.dtype)
+            attn_output = torch.bmm(attn_probs, v)              # base 不动
+            attn_output_1 = torch.bmm(attn_probs_1, v_pert)
         else:
             # orginal version 
             if attn_scores.dtype == torch.float16:
@@ -550,8 +565,6 @@ class OPTAttention(nn.Module):
         
             attn_output = torch.bmm(attn_probs, v)
             attn_output_1 = torch.bmm(attn_probs_1, v + dv)
-    
-        diff_attn_output = attn_output_1 - attn_output
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -560,11 +573,11 @@ class OPTAttention(nn.Module):
 
         attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
-
+        
         attn_output_1 = attn_output_1.view(bsz, self.num_heads, tgt_len, self.head_dim)
         attn_output_1 = attn_output_1.transpose(1, 2).reshape(bsz, tgt_len, self.embed_dim)
-
-        diff_attn_output = attn_output_1 - attn_output
+        
+        diff_attn_output = attn_output_1 - attn_output.float()
 
         attn_output, diff_attn_output = self.out_proj.forward_delta(attn_output, diff_attn_output)
 
@@ -701,10 +714,12 @@ class OPTDecoderLayer(nn.Module):
             output_attentions=output_attentions,
         )
         attn_out_base = F.dropout(attn_out, p=self.dropout, training=self.training)
-        attn_out_pert = F.dropout(attn_out + diff_attn_out, p=self.dropout, training=self.training)
-        diff_attn_out_drop = attn_out_pert - attn_out_base
+        attn_out_pert = F.dropout(attn_out.float() + diff_attn_out, p=self.dropout, training=self.training)
+        diff_attn_out_drop = attn_out_pert - attn_out_base.float()
+        
         hidden_states = residual + attn_out_base
-        diff_hidden_states = diff_residual + diff_attn_out_drop
+        diff_hidden_states = diff_residual.float() + diff_attn_out_drop
+        # print("after attn:", hidden_states.dtype, diff_hidden_states.dtype)
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -729,19 +744,21 @@ class OPTDecoderLayer(nn.Module):
         hidden_states, diff_hidden_states = self.fc1.forward_delta(hidden_states, diff_hidden_states)
         # activation 
         act_base = self.activation_fn(hidden_states)
-        act_pert = self.activation_fn(hidden_states + diff_hidden_states)
+        act_pert = self.activation_fn(hidden_states.float() + diff_hidden_states)
+        
         hidden_states = act_base
-        diff_hidden_states = act_pert - act_base
+        diff_hidden_states = act_pert - act_base.float()
         # fc2
         hidden_states, diff_hidden_states = self.fc2.forward_delta(hidden_states, diff_hidden_states)
+        # print("after ffn:", hidden_states.dtype, diff_hidden_states.dtype)
         # dropout
         ffn_out_base = F.dropout(hidden_states, p=self.dropout, training=self.training)
-        ffn_out_pert = F.dropout(hidden_states + diff_hidden_states, p=self.dropout, training=self.training)
-        diff_ffn_out_drop = ffn_out_pert - ffn_out_base
+        ffn_out_pert = F.dropout(hidden_states.float() + diff_hidden_states, p=self.dropout, training=self.training)
+        diff_ffn_out_drop = ffn_out_pert - ffn_out_base.float()
 
         # residual add + view back
         hidden_states = (residual + ffn_out_base).view(hidden_states_shape)
-        diff_hidden_states = (diff_residual + diff_ffn_out_drop).view(hidden_states_shape)
+        diff_hidden_states = (diff_residual.float() + diff_ffn_out_drop).view(hidden_states_shape)
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -1156,11 +1173,13 @@ class OPTDecoder(OPTPreTrainedModel):
             input_shape = inputs_embeds.size()[:-1]
             if diff_inputs_embeds is None:
                 raise ValueError("inputs_embeds is provided but diff_inputs_embeds is None (no fallback allowed).")
+            diff_inputs_embeds = diff_inputs_embeds.float()
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
     
         if inputs_embeds is None:
             inputs_embeds, diff_inputs_embeds = self.embed_tokens.forward_delta(input_ids)
+            diff_inputs_embeds = diff_inputs_embeds.float()
     
         batch_size, seq_length = input_shape
     
@@ -1177,12 +1196,15 @@ class OPTDecoder(OPTPreTrainedModel):
         )
     
         pos_embeds, diff_pos_embeds = self.embed_positions.forward_delta(attention_mask, past_key_values_length)
-    
+        diff_pos_embeds = diff_pos_embeds.float()
+        
         if self.project_in is not None:
             inputs_embeds, diff_inputs_embeds = self.project_in.forward_delta(inputs_embeds, diff_inputs_embeds)
-    
+            diff_inputs_embeds = diff_inputs_embeds.float()
+        
         hidden_states = inputs_embeds + pos_embeds
-        diff_hidden_states = diff_inputs_embeds + diff_pos_embeds
+        diff_hidden_states = diff_inputs_embeds.float() + diff_pos_embeds.float()
+        # print("decoder input:", hidden_states.dtype, diff_hidden_states.dtype)
     
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -1243,7 +1265,9 @@ class OPTDecoder(OPTPreTrainedModel):
     
         if self.project_out is not None:
             hidden_states, diff_hidden_states = self.project_out.forward_delta(hidden_states, diff_hidden_states)
-    
+        
+        # print("decoder output:", hidden_states.dtype, diff_hidden_states.dtype)
+        
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states_base += (hidden_states,)
@@ -1645,15 +1669,17 @@ class OPTForCausalLM(OPTPreTrainedModel):
     
         if return_dict:
             hidden_states = dec_out.last_hidden_state
-            diff_hidden_states = dec_out.diff_last_hidden_state
+            diff_hidden_states = dec_out.diff_last_hidden_state.float()
         else:
             hidden_states = dec_out[0]
-            diff_hidden_states = dec_out[1]
+            diff_hidden_states = dec_out[1].float()
     
         logits, diff_logits = self.lm_head.forward_delta(hidden_states, diff_hidden_states)
-        logits = logits.contiguous()
-        diff_logits = diff_logits.contiguous()
-        logits_pert = (logits + diff_logits).contiguous()
+        logits = logits.contiguous()                    # base 原 dtype
+        diff_logits = diff_logits.float().contiguous()  # diff fp32
+        logits_pert = (logits.float() + diff_logits).contiguous()
+        
+        # print("lm_head:", logits.dtype, diff_logits.dtype, logits_pert.dtype)
     
         loss = None
         loss_pert = None

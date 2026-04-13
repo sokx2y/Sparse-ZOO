@@ -1305,6 +1305,14 @@ def main():
                                    enable_w=data_args.enable_w, enable_x=data_args.enable_x, enable_diffx=data_args.enable_diffx, enable_diffw=data_args.enable_diffw, 
                                    uv_provider=uv_provider, z_provider=z_provider)
             apply_trainable_mode(model, training_args.trainable_mode, logger=logger)
+            
+        if model.config.model_type == "opt":
+            QuantizeOPTForLOZO(model=self.model,
+                                 mx_w_elem_format=self.args.mx_w_elem_format, mx_a_elem_format=self.args.mx_a_elem_format, mx_diffw_elem_format=self.args.mx_diffw_elem_format, mx_diffa_elem_format=self.args.mx_diffa_elem_format, 
+                                 enable_w=self.args.enable_w, enable_x=self.args.enable_x, enable_diffx=self.args.enable_diffx, enable_diffw=self.args.enable_diffw, 
+                                 uv_provider=uv_provider, z_provider=z_provider)
+            apply_trainable_mode(model, training_args.trainable_mode, logger=logger)
+            
         logger.info("Replace All nnLayers with diffLayers to support forward_delta")
         print(f"model:{model}") 
         
