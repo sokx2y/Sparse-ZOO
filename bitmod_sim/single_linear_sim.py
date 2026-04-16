@@ -52,6 +52,24 @@ def _shape_tuple(tensor_or_shape: Any, tensor_name: str) -> Tuple[int, ...]:
     return shape
 
 
+def _ensure_supported_runtime() -> None:
+    if os.name != "nt":
+        return
+
+    cacti_binary = os.path.join(os.path.dirname(__file__), "mem", "cacti", "cacti")
+    if not os.path.exists(cacti_binary):
+        return
+
+    with open(cacti_binary, "rb") as handle:
+        magic = handle.read(4)
+
+    if magic == b"\x7fELF":
+        raise RuntimeError(
+            "The repository's CACTI binary is Linux ELF. Full latency/energy simulation "
+            "requires a Linux environment; no Windows compatibility changes were made."
+        )
+
+
 class SingleLinearSimulator(Accelerator):
     """
     Simulate one linear layer with the same PE-array / memory model as `Accelerator`.
@@ -140,7 +158,7 @@ class SingleLinearSimulator(Accelerator):
         self.cycle_compute = None
         self.mem_initialized = False
         if init_mem:
-            # _ensure_supported_runtime()
+            _ensure_supported_runtime()
             self._init_mem()
             self._check_layer_mem_size()
             self._calc_num_mem_refetch()

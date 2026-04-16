@@ -11,14 +11,14 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
 
 mkdir -p ./result
 
-BATCH_SIZE=16
-CXT_LEN=64
-IN_FEATURES=1024
+BATCH_SIZE=64
+CXT_LEN=49
+IN_FEATURES=8
 OUT_FEATURES=1024
 
 I_PREC=4
 KV_PREC=8
-W_PREC=4
+W_PREC=8
 OUTPUT_PREC=16
 
 # PE_array size and area/enery use bitmod settings
@@ -72,7 +72,7 @@ if [[ ${IS_BIT_SERIAL} -eq 1 ]]; then
     BIT_SERIAL_FLAG="--is_bit_serial"
 fi
 
-python single_linear_simBB.py \
+python single_linear_sim_bitFusion.py \
     --batch_size ${BATCH_SIZE} \
     --cxt_len ${CXT_LEN} \
     --in_features ${IN_FEATURES} \

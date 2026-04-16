@@ -6,14 +6,13 @@ from single_linear_sim import (
     SingleLinearSimulator,
     _build_argparser as _build_base_argparser,
     _ensure_supported_runtime,
-    _print_summary as _print_base_summary,
     get_default_bitmod_config,
 )
 
 
 DEFAULT_OUTPUT_PRECISION_BITS = 16
-DEFAULT_BASE_ACTIVATION_PRECISION_BITS = 16
-DEFAULT_BASE_WEIGHT_PRECISION_BITS = 16
+DEFAULT_BASE_ACTIVATION_PRECISION_BITS = 8
+DEFAULT_BASE_WEIGHT_PRECISION_BITS = 8
 
 
 def get_default_bitmodbb_config(
@@ -66,7 +65,7 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
         output_prec: float = DEFAULT_OUTPUT_PRECISION_BITS,
         batch_size: int = 1,
         is_bit_serial: bool = False,
-        pe_dp_size: int = 1,  # 考虑到这个以bit为level， 一个FU处理的是8bit*8bit的GEMM， 按照一个16*16为一个点积，本来应该是0.25；我们这里按照一个FU有8*8个BB来仿。
+        pe_dp_size: int = 1,
         pe_energy: float = 0,
         pe_area: float = 0,
         pe_array_dim: Sequence[int] = (),
@@ -312,6 +311,24 @@ def _build_argparser() -> argparse.ArgumentParser:
         "precision-sensitive throughput for non-bit-serial mode."
     )
     parser.add_argument(
+        "--i_prec",
+        type=float,
+        default=None,
+        help="Activation precision in bits. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--kv_prec",
+        type=float,
+        default=None,
+        help="KV-cache precision in bits. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--w_prec",
+        type=float,
+        default=None,
+        help="Weight precision in bits. Overrides the default config when provided.",
+    )
+    parser.add_argument(
         "--output_prec",
         type=float,
         default=DEFAULT_OUTPUT_PRECISION_BITS,
@@ -330,6 +347,41 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Base weight precision used by the non-bit-serial FU model.",
     )
     parser.add_argument(
+        "--pe_dp_size",
+        type=int,
+        default=None,
+        help="PE dot-product size. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--pe_energy",
+        type=float,
+        default=None,
+        help="PE energy in pJ. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--pe_area",
+        type=float,
+        default=None,
+        help="PE area. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--pe_array_h",
+        type=int,
+        default=None,
+        help="PE array height. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--pe_array_w",
+        type=int,
+        default=None,
+        help="PE array width. Overrides the default config when provided.",
+    )
+    parser.add_argument(
+        "--is_bit_serial",
+        action="store_true",
+        help="Enable bit-serial mode. Default BitFusion-like runs should leave this disabled.",
+    )
+    parser.add_argument(
         "--sanity_check",
         action="store_true",
         help="Run a minimal trend check without initializing CACTI memories.",
@@ -337,8 +389,68 @@ def _build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_optional_overrides(
+    config: Dict[str, Any], args: argparse.Namespace
+) -> Dict[str, Any]:
+    overridden = dict(config)
+
+    if args.i_prec is not None:
+        overridden["I_PREC"] = args.i_prec
+    if args.kv_prec is not None:
+        overridden["KV_PREC"] = args.kv_prec
+    if args.w_prec is not None:
+        overridden["W_PREC"] = args.w_prec
+    if args.pe_dp_size is not None:
+        overridden["PE_DP_SIZE"] = args.pe_dp_size
+    if args.pe_energy is not None:
+        overridden["PE_ENERGY"] = args.pe_energy
+    if args.pe_area is not None:
+        overridden["PE_AREA"] = args.pe_area
+    if args.pe_array_h is not None or args.pe_array_w is not None:
+        pe_h, pe_w = overridden["PE_ARRAY_DIM"]
+        overridden["PE_ARRAY_DIM"] = [
+            args.pe_array_h if args.pe_array_h is not None else pe_h,
+            args.pe_array_w if args.pe_array_w is not None else pe_w,
+        ]
+
+    overridden["IS_BIT_SERIAL"] = bool(args.is_bit_serial)
+    overridden["OUTPUT_PREC"] = args.output_prec
+    overridden["BASE_ACTIVATION_PREC"] = args.base_activation_prec
+    overridden["BASE_WEIGHT_PREC"] = args.base_weight_prec
+    return overridden
+
+
 def _print_summary(result: Dict[str, Any]) -> None:
-    _print_base_summary(result)
+    energy_uJ = {name: value / 1e6 for name, value in result["energy_pj"].items()}
+
+    print(f'layer: {result["layer_name"]}')
+    print(
+        "shape: "
+        f'x={result["x_shape"]}, '
+        f'w={result["w_shape"]}, '
+        f'y={result["y_shape"]}, '
+        f'gemm(M,N,K)=({result["gemm_shape"]["m"]}, {result["gemm_shape"]["n"]}, {result["gemm_shape"]["k"]})'
+    )
+    print(f'compute latency:    {result["cycle"]["compute"]} cycles')
+    print(f'dram latency:       {result["cycle"]["dram"]} cycles')
+    print(f'total latency:      {result["cycle"]["total"]} cycles')
+    print(
+        "total cycle:        "
+        f'({result["cycle"]["compute"]}, {result["cycle"]["total"]})'
+    )
+    print(f'tile count:         {result["tile_count"]}')
+    print(f'num mem refetch:    {result["num_mem_refetch"]}')
+    print(f'memory bytes:       {result["memory_bytes"]}')
+    print(f'pe array area:      {result["area_mm2"]["pe_array"]} mm2')
+    print(f'weight buffer area: {result["area_mm2"]["weight_buffer"]} mm2')
+    print(f'input buffer area:  {result["area_mm2"]["input_buffer"]} mm2')
+    print(f'compute energy:     {energy_uJ["compute"]} uJ')
+    print(f'sram rd energy:     {energy_uJ["sram_rd"]} uJ')
+    print(f'sram wr energy:     {energy_uJ["sram_wr"]} uJ')
+    print(f'dram energy:        {energy_uJ["dram"]} uJ')
+    print(f'on-chip energy:     {energy_uJ["onchip"]} uJ')
+    print(f'total energy:       {energy_uJ["total"]} uJ')
+
     precision_bits = result.get("precision_bits", {})
     if precision_bits:
         print(f"precision bits:    {precision_bits}")
@@ -408,6 +520,7 @@ if __name__ == "__main__":
             is_lossless=args.is_lossless,
             output_prec=args.output_prec,
         )
+        bitmod_cfg = _apply_optional_overrides(bitmod_cfg, args)
 
         if args.is_generation:
             x = (1, bitmod_cfg["BATCH_SIZE"], args.in_features)
