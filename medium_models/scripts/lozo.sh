@@ -16,7 +16,7 @@ export TQDM_DISABLE=1
 
 FEW_SHOT_TYPE=${FEW_SHOT_TYPE:-"prompt"}
 
-TASK=${TASK:-sst-5}
+TASK=${TASK:-RTE}
 K=${K:-512}
 SEED=${SEED:-42}
 BS=${BS:-64}
