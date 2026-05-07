@@ -327,6 +327,58 @@ class diffLayerNorm(nn.LayerNorm):
         return output, diff_output
             
 
+class diffLlamaRMSNorm(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-6,
+        layer_name="",
+        z_provider=None,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
+        self.variance_epsilon = eps
+        self.layer_name = layer_name
+        self.z_provider = z_provider
+        self.inference_count = 0
+
+    def _rms_norm(self, hidden_states: torch.Tensor, weight: torch.Tensor):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return weight * hidden_states.to(input_dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self._rms_norm(hidden_states, self.weight)
+
+    def forward_delta(self, hidden_states: torch.Tensor, diff_hidden_states: torch.Tensor):
+        self.inference_count += 1
+        output = self.forward(hidden_states)
+
+        input_1 = hidden_states.float() + diff_hidden_states.float()
+        weight_1 = self.weight.float()
+        if self.z_provider is not None:
+            z, scale = self.z_provider(
+                self.layer_name + ".weight",
+                self.weight.shape,
+                self.weight.device,
+                self.weight.dtype,
+                self.inference_count,
+            )
+            weight_1 = self.weight.float() + z.float() * float(scale)
+
+        output_1 = self._rms_norm(input_1, weight_1)
+        diff_output = output_1 - output.float()
+
+        return output, diff_output
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
 def get_all_QdiffLinear(model: nn.Module):
     QdiffLinears = []    
     def find_linears(module):
@@ -338,6 +390,17 @@ def get_all_QdiffLinear(model: nn.Module):
             
     find_linears(model)
     return QdiffLinears
+
+def get_all_diffLinear(model: nn.Module):
+    diffLinears = []
+    def find_linears(module):
+        for child in module.children():
+            if isinstance(child, diffLinear):
+                diffLinears.append(child)
+            find_linears(child)
+
+    find_linears(model)
+    return diffLinears
 
 def get_all_diffEmbedding(model: nn.Module):
     diff_embs = []
@@ -359,6 +422,17 @@ def get_all_diffLayerNorm(model: nn.Module):
             find_LayerNorm(child)
 
     find_LayerNorm(model)
+    return diff_norm
+
+def get_all_diffLlamaRMSNorm(model: nn.Module):
+    diff_norm = []
+    def find_LlamaRMSNorm(module: nn.Module):
+        for child in module.children():
+            if isinstance(child, diffLlamaRMSNorm):
+                diff_norm.append(child)
+            find_LlamaRMSNorm(child)
+
+    find_LlamaRMSNorm(model)
     return diff_norm
 
 # ---------------------------------------------------------------------
@@ -652,3 +726,88 @@ def QuantizeOPTForLOZO(
         print(model)
     else:
         print("Model is not an OPT model, skip QuantizeOPTForLOZO.")
+
+
+def QuantizeLlamaForLOZO(
+    enable_w, enable_x, enable_diffw, enable_diffx,
+    model: nn.Module,
+    mx_w_elem_format=None,
+    mx_a_elem_format=None,
+    mx_diffw_elem_format=None,
+    mx_diffa_elem_format=None,
+    uv_provider=None,
+    z_provider=None,
+):
+
+    def replace_llama_module(module, prefix=""):
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+
+            is_embed_tokens = (full_name == "model.embed_tokens")
+            in_model_layers = full_name.startswith("model.layers")
+            is_lm_head = (full_name == "lm_head")
+
+            if is_embed_tokens and isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
+                new_emb = diffEmbedding(
+                    num_embeddings=child.num_embeddings,
+                    embedding_dim=child.embedding_dim,
+                    padding_idx=child.padding_idx,
+                    max_norm=child.max_norm,
+                    norm_type=child.norm_type,
+                    scale_grad_by_freq=child.scale_grad_by_freq,
+                    sparse=child.sparse,
+                    layer_name=full_name,
+                    uv_provider=uv_provider,
+                    device="meta",
+                    dtype=child.weight.dtype,
+                )
+                new_emb.weight = child.weight
+                setattr(module, name, new_emb)
+                print(f"Replace {full_name} with diffEmbedding")
+                continue
+
+            if (in_model_layers or is_lm_head) and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+                provider_layer_name = full_name
+                if is_lm_head and child.weight is model.model.embed_tokens.weight:
+                    provider_layer_name = "model.embed_tokens"
+
+                new_linear = diffLinear(
+                    layer_name=provider_layer_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_linear.weight = child.weight
+                if child.bias is not None:
+                    new_linear.bias = child.bias
+                setattr(module, name, new_linear)
+                if is_lm_head:
+                    print(f"Replace {full_name} with diffLinear, provider layer_name={provider_layer_name}")
+                else:
+                    print(f"Replace {full_name} with diffLinear")
+                continue
+
+            if child.__class__.__name__ == "LlamaRMSNorm":
+                new_norm = diffLlamaRMSNorm(
+                    hidden_size=child.weight.shape[0],
+                    eps=child.variance_epsilon,
+                    layer_name=full_name,
+                    z_provider=z_provider,
+                    device="meta",
+                    dtype=child.weight.dtype,
+                )
+                new_norm.weight = child.weight
+                setattr(module, name, new_norm)
+                print(f"Replace {full_name} with diffLlamaRMSNorm")
+                continue
+
+            replace_llama_module(child, full_name)
+
+    if getattr(model, "config", None) is not None and model.config.model_type == "llama":
+        replace_llama_module(model)
+    else:
+        print("Model is not a Llama model, skip QuantizeLlamaForLOZO.")
