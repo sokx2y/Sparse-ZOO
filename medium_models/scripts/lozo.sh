@@ -10,13 +10,13 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 source ~/.bashrc
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=5
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
 FEW_SHOT_TYPE=${FEW_SHOT_TYPE:-"prompt"}
 
-TASK=${TASK:-RTE}
+TASK=${TASK:-MNLI}
 K=${K:-512}
 SEED=${SEED:-42}
 BS=${BS:-64}
@@ -61,7 +61,7 @@ WEIGHT_BIT=${WEIGHT_BIT:-4}
 
 # ----------------- Here! ------------------
 # forward_delta 
-APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-false}
+APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-true}
 ENABLE_X=${ENABLE_X:-true}
 ENABLE_DIFFX=${ENABLE_DIFFX:-true}
 ENABLE_W=${ENABLE_W:-true}

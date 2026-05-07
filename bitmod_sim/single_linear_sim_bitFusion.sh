@@ -11,15 +11,16 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}
 
 mkdir -p ./result
 
-BATCH_SIZE=64
-CXT_LEN=49
-IN_FEATURES=8
-OUT_FEATURES=1024
+BATCH_SIZE=16
+CXT_LEN=296
+IN_FEATURES=16384
+OUT_FEATURES=2
 
-I_PREC=4
-KV_PREC=8
 W_PREC=8
+I_PREC=4
 OUTPUT_PREC=16
+
+KV_PREC=8
 
 # PE_array size and area/enery use bitmod settings
 PE_DP_SIZE=1   # this is not bitmod, but bitfusion. so we set it as 1, meaning each PE finish 1 element dot product in 1 cycle

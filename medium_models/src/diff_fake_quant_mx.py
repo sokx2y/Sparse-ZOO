@@ -121,7 +121,7 @@ class QdiffLinear(nn.Linear):
         self.mx_specs0 = finalize_mx_specs(mx_specs0)
         # specs1: linear(diff_x, weight_even)
         mx_specs1 = {
-            'w_elem_format': self.mx_w_elem_format,
+            'w_elem_format': "fp4_e2m1",
             'a_elem_format': self.mx_diffa_elem_format,
             'scale_bits': 8,
             'block_size': 16,
@@ -407,48 +407,48 @@ def QuantizeRobertaForLOZO(
                 continue
             
             # 别忘记这里应该是QdiffLinear
-            # if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
-            #     new_qlinear = QdiffLinear(
-            #         enable_x=enable_x,
-            #         enable_diffx=enable_diffx,
-            #         enable_w=enable_w,
-            #         enable_diffw=enable_diffw,
-            #         layer_name=full_name,
-            #         in_features=child.in_features,
-            #         out_features=child.out_features,
-            #         bias=(child.bias is not None),
-            #         device=child.weight.device,
-            #         dtype=child.weight.dtype,
-            #         mx_w_elem_format=mx_w_elem_format,
-            #         mx_a_elem_format=mx_a_elem_format,
-            #         mx_diffw_elem_format=mx_diffw_elem_format,
-            #         mx_diffa_elem_format=mx_diffa_elem_format,
-            #         uv_provider=uv_provider,
-            #         z_provider=z_provider,
-            #     )
-            #     new_qlinear.weight.data = child.weight.data.clone()
-            #     if child.bias is not None:
-            #         new_qlinear.bias.data = child.bias.data.clone()
-            #     setattr(module, name, new_qlinear)
-            #     print(f"Replace {full_name} with QdiffLinear")
-            #     continue
-            if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
-                new_dlinear = diffLinear(
+            if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
+                new_qlinear = QdiffLinear(
+                    enable_x=enable_x,
+                    enable_diffx=enable_diffx,
+                    enable_w=enable_w,
+                    enable_diffw=enable_diffw,
                     layer_name=full_name,
                     in_features=child.in_features,
                     out_features=child.out_features,
                     bias=(child.bias is not None),
                     device=child.weight.device,
                     dtype=child.weight.dtype,
+                    mx_w_elem_format=mx_w_elem_format,
+                    mx_a_elem_format=mx_a_elem_format,
+                    mx_diffw_elem_format=mx_diffw_elem_format,
+                    mx_diffa_elem_format=mx_diffa_elem_format,
                     uv_provider=uv_provider,
                     z_provider=z_provider,
                 )
-                new_dlinear.weight.data = child.weight.data.clone()
+                new_qlinear.weight.data = child.weight.data.clone()
                 if child.bias is not None:
-                    new_dlinear.bias.data = child.bias.data.clone()
-                setattr(module, name, new_dlinear)
-                print(f"Replace {full_name} with diffLinear")
+                    new_qlinear.bias.data = child.bias.data.clone()
+                setattr(module, name, new_qlinear)
+                print(f"Replace {full_name} with QdiffLinear")
                 continue
+            # if in_encoder and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+            #     new_dlinear = diffLinear(
+            #         layer_name=full_name,
+            #         in_features=child.in_features,
+            #         out_features=child.out_features,
+            #         bias=(child.bias is not None),
+            #         device=child.weight.device,
+            #         dtype=child.weight.dtype,
+            #         uv_provider=uv_provider,
+            #         z_provider=z_provider,
+            #     )
+            #     new_dlinear.weight.data = child.weight.data.clone()
+            #     if child.bias is not None:
+            #         new_dlinear.bias.data = child.bias.data.clone()
+            #     setattr(module, name, new_dlinear)
+            #     print(f"Replace {full_name} with diffLinear")
+            #     continue
             
             if (not in_encoder) and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
                 new_dlinear = diffLinear(

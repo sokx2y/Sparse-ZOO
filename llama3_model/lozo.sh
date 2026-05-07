@@ -18,13 +18,15 @@ export TRANSFORMERS_OFFLINE=1
 
 # 加载 Conda 环境
 source ~/.bashrc
-conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
+# conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
+conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/lozo_llama3
 
 export CUDA_VISIBLE_DEVICES=7
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
-MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-6.7b}
+# MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-6.7b}
+MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/Llama-3.2-3B}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
@@ -47,7 +49,7 @@ elif [ "$MODE" == "lora" ]; then
 fi
 
 LR=2e-7
-TASK=SST-2
+TASK=WIC
 SEED=0
 RANK=2
 STEP_INTERVAL=100

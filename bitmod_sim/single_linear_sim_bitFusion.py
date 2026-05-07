@@ -128,6 +128,12 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
         del layer_name
         return float(self.output_prec)
 
+    def _get_activation_lane_scaling(self) -> float:
+        return self.base_activation_prec / float(self.i_prec)
+
+    def _get_weight_lane_scaling(self, layer_name: str) -> float:
+        return self.base_weight_prec / self._get_weight_precision(layer_name)
+
     def get_precision_speedup(self, activation_prec: float, weight_prec: float) -> float:
         """
         Return the idealized non-bit-serial throughput scaling relative to a
@@ -256,6 +262,22 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
         energy_o_sram_wr = num_o_sram_wr * i_sram_wr_cost
 
         return energy_w_sram_wr + energy_i_sram_wr + energy_o_sram_wr
+
+    def calc_sram_rd_energy(self):
+        total_energy = 0.0
+        activation_lane_scaling = self._get_activation_lane_scaling()
+
+        for name in self.layer_name_list:
+            w_dim = self.weight_dim[name]
+            o_dim = self.output_dim[name]
+            total_tile = self._calc_tile_fc(w_dim, o_dim)
+            weight_lane_scaling = self._get_weight_lane_scaling(name)
+
+            w_rd_energy = math.ceil(total_tile / weight_lane_scaling) * self.w_sram.r_cost
+            i_rd_energy = math.ceil(total_tile / activation_lane_scaling) * self.i_sram.r_cost
+            total_energy += w_rd_energy + i_rd_energy
+
+        return total_energy
 
     def collect_modeling_snapshot(self) -> Dict[str, Any]:
         """
