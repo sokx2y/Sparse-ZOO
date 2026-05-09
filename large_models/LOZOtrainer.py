@@ -924,15 +924,18 @@ class LowRankTrainer(Trainer):
         provide z to replace diff_bias and diff_weight in layernorm
         """
         def provider(param_name, shape, device, dtype, inference_count):
-            z = None
-            if hasattr(self, "z"):
-                z = self.z.get(param_name, None)
-            if z is None:
-                z = torch.normal(mean=0.0, std=1.0, size=shape, device=device, dtype=dtype)
+            if not hasattr(self, "z") or param_name not in self.z:
+                keys = list(self.z.keys())[:20] if hasattr(self, "z") else []
+                raise RuntimeError(
+                    f"[FD_PROVIDER_MISS][z] param_name={param_name}, "
+                    f"shape={shape}, inference_count={inference_count}. "
+                    f"First cached z keys={keys}"
+                )
+    
+            z = self.z[param_name]
             scale = -2 * self.args.zo_eps
             return z, scale
-            # return z, 0
-        
+    
         return provider
     
     def make_uv_provider(self):
@@ -940,25 +943,28 @@ class LowRankTrainer(Trainer):
         provide u,v^t to replace diff_weight in our quantize method(QdiffLinear).
         """
         def provider(param_name, shape, device, dtype, inference_count):
-            out_f, in_f = shape
-            # provide v from cache
-            v = None
-            if hasattr(self, "v"):
-                v = self.v.get(param_name, None)
-            if v is None: 
-                v = torch.randn(in_f, self.args.rank_r, device=device, dtype=dtype)
-            # use cache_u directly
-            u = None
-            if hasattr(self, "u"):
-                u = self.u.get(param_name, None)
-            if u is None: 
-                u = torch.randn(out_f, self.args.rank_r, device=device, dtype=dtype)
-            
-            # The difference between the even iteration and the odd cached weights is −2×zo_eps×(UVT).
+            if not hasattr(self, "u") or param_name not in self.u:
+                keys = list(self.u.keys())[:20] if hasattr(self, "u") else []
+                raise RuntimeError(
+                    f"[FD_PROVIDER_MISS][u] param_name={param_name}, "
+                    f"shape={shape}, inference_count={inference_count}. "
+                    f"First cached u keys={keys}"
+                )
+    
+            if not hasattr(self, "v") or param_name not in self.v:
+                keys = list(self.v.keys())[:20] if hasattr(self, "v") else []
+                raise RuntimeError(
+                    f"[FD_PROVIDER_MISS][v] param_name={param_name}, "
+                    f"shape={shape}, inference_count={inference_count}. "
+                    f"First cached v keys={keys}"
+                )
+    
+            u = self.u[param_name]
+            v = self.v[param_name]
+    
             scale = -2 * self.args.zo_eps
             return u, v, scale
-            # return u, v, 0
-             
+    
         return provider
     
     
