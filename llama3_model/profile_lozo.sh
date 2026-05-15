@@ -9,14 +9,14 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # 加载 Conda 环境
 source ~/.bashrc
-conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
+conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/lozo_llama3
 
 
 # 只覆盖 lozo.sh 里支持 ${VAR:-default} 的变量
 export LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"testprofile"}
 
 # export MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-13b}
-export MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-6.7b}
+MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/Llama-3.2-3B}
 
 
 export MODE=${MODE:-ft}     

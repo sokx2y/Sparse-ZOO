@@ -358,8 +358,8 @@ class diffLlamaRMSNorm(nn.Module):
         self.inference_count += 1
         output = self.forward(hidden_states)
 
-        input_1 = hidden_states.float() + diff_hidden_states.float()
-        weight_1 = self.weight.float()
+        input_1 = hidden_states + diff_hidden_states
+        weight_1 = self.weight
         if self.z_provider is not None:
             z, scale = self.z_provider(
                 self.layer_name + ".weight",
@@ -368,10 +368,10 @@ class diffLlamaRMSNorm(nn.Module):
                 self.weight.dtype,
                 self.inference_count,
             )
-            weight_1 = self.weight.float() + z.float() * float(scale)
+            weight_1 = self.weight + z * scale
 
         output_1 = self._rms_norm(input_1, weight_1)
-        diff_output = output_1 - output.float()
+        diff_output = output_1 - output
 
         return output, diff_output
 
@@ -738,13 +738,12 @@ def QuantizeLlamaForLOZO(
     uv_provider=None,
     z_provider=None,
 ):
-
     def replace_llama_module(module, prefix=""):
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
 
             is_embed_tokens = (full_name == "model.embed_tokens")
-            in_model_layers = full_name.startswith("model.layers")
+            in_decoder_layers = full_name.startswith("model.layers")
             is_lm_head = (full_name == "lm_head")
 
             if is_embed_tokens and isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
@@ -766,13 +765,9 @@ def QuantizeLlamaForLOZO(
                 print(f"Replace {full_name} with diffEmbedding")
                 continue
 
-            if (in_model_layers or is_lm_head) and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
-                provider_layer_name = full_name
-                if is_lm_head and child.weight is model.model.embed_tokens.weight:
-                    provider_layer_name = "model.embed_tokens"
-
+            if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, (diffLinear, QdiffLinear)):
                 new_linear = diffLinear(
-                    layer_name=provider_layer_name,
+                    layer_name=full_name,
                     in_features=child.in_features,
                     out_features=child.out_features,
                     bias=(child.bias is not None),
@@ -785,10 +780,66 @@ def QuantizeLlamaForLOZO(
                 if child.bias is not None:
                     new_linear.bias = child.bias
                 setattr(module, name, new_linear)
-                if is_lm_head:
-                    print(f"Replace {full_name} with diffLinear, provider layer_name={provider_layer_name}")
-                else:
-                    print(f"Replace {full_name} with diffLinear")
+                print(f"Replace decoder linear {full_name} with diffLinear")
+                continue
+                # new_qlinear = QdiffLinear(
+                #     enable_x=enable_x,
+                #     enable_diffx=enable_diffx,
+                #     enable_w=enable_w,
+                #     enable_diffw=enable_diffw,
+                #     layer_name=full_name,
+                #     in_features=child.in_features,
+                #     out_features=child.out_features,
+                #     bias=(child.bias is not None),
+                #     device="meta",
+                #     dtype=child.weight.dtype,
+                #     mx_w_elem_format=mx_w_elem_format,
+                #     mx_a_elem_format=mx_a_elem_format,
+                #     mx_diffw_elem_format=mx_diffw_elem_format,
+                #     mx_diffa_elem_format=mx_diffa_elem_format,
+                #     uv_provider=uv_provider,
+                #     z_provider=z_provider,
+                # )
+                # new_qlinear.weight = child.weight
+                # if child.bias is not None:
+                #     new_qlinear.bias = child.bias
+                # setattr(module, name, new_qlinear)
+                # print(f"Replace decoder linear {full_name} with QdiffLinear")
+                # continue
+
+            # lm_head Linear:
+            # Always use diffLinear for now.
+            if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+                provider_layer_name = full_name
+
+                try:
+                    if (
+                        hasattr(model, "model")
+                        and hasattr(model.model, "embed_tokens")
+                        and child.weight is model.model.embed_tokens.weight
+                    ):
+                        provider_layer_name = "model.embed_tokens"
+                except Exception:
+                    provider_layer_name = full_name
+
+                new_head = diffLinear(
+                    layer_name=provider_layer_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_head.weight = child.weight
+                if child.bias is not None:
+                    new_head.bias = child.bias
+                setattr(module, name, new_head)
+                print(
+                    f"Replace {full_name} with diffLinear, "
+                    f"provider layer_name={provider_layer_name}"
+                )
                 continue
 
             if child.__class__.__name__ == "LlamaRMSNorm":
@@ -805,6 +856,7 @@ def QuantizeLlamaForLOZO(
                 print(f"Replace {full_name} with diffLlamaRMSNorm")
                 continue
 
+            # Recurse into child modules
             replace_llama_module(child, full_name)
 
     if getattr(model, "config", None) is not None and model.config.model_type == "llama":

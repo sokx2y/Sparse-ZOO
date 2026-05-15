@@ -45,6 +45,11 @@ def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=N
     if labels is None:
         return outputs
     logits = outputs.logits
+    logit_device = logits.device
+    if input_ids is not None and isinstance(input_ids, torch.Tensor):
+        input_ids = input_ids.to(logit_device)
+    if labels is not None and isinstance(labels, torch.Tensor):
+        labels = labels.to(logit_device)
 
     loss = None
     # Shift so that tokens < n predict n

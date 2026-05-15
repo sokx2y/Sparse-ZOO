@@ -21,12 +21,11 @@ from torch.utils.data import Dataset
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from metrics import calculate_metric
 from utils import *
-from LOZOtrainer import LowRankTrainer
+from LOZOtrainerDEbug import LowRankTrainer
 from LOZOtrainer0 import LowRankTrainer as OrdinaryLowRankTrainer
 import random
-from diff_fake_quant_mx import QuantizeOPTForLOZO, QuantizeLlamaForLOZO
-from modeling_opt import OPTForCausalLM
-from modeling_llama import LlamaForCausalLM
+from diff_fake_quant_mxDEbug import QuantizeOPTForLOZO
+from modeling_opt import OPTForCausalLM 
 
 
 @dataclass
@@ -64,18 +63,7 @@ class OurArguments(TrainingArguments):
     ## - LOZO: low rank zeroth-order (LOZO) training
     only_train_option: bool = True # whether to only train the option part of the input
     train_as_classification: bool = False # take the log likelihood of all options and train as classification 
-    
-    # test LOZO muti-GPU
-    debug_device_preflight: bool = field(
-        default=False,
-        metadata={"help": "Run one train forward_delta batch and one eval normal-forward batch before training."}
-    )
-    
-    debug_device_preflight_only: bool = field(
-        default=False,
-        metadata={"help": "Run device preflight and exit without training."}
-    )
-    
+
     # LOZO
     zo_eps: float = 1e-3 # eps in LOZO
     step_interval: int = 50 # $\nu$ in LOZO
@@ -127,6 +115,21 @@ class OurArguments(TrainingArguments):
     apply_forward_delta: bool = field(
         default=False,
         metadata={"help":"Use all difflayer in diff_fake_quant_mx.py"}
+    )
+
+    debug_phase1_compare: bool = field(
+        default=False,
+        metadata={"help": "Debug only. Compare explicit LOZO and forward_delta losses in the same step."},
+    )
+
+    debug_phase1_jsonl: str = field(
+        default="phase1_compare.jsonl",
+        metadata={"help": "JSONL path for Phase1 compare logs."},
+    )
+
+    debug_fd_exact_effective_delta: bool = field(
+        default=False,
+        metadata={"help": "Debug only. If true, forward_delta materializes effective fp16 W_minus for perturbed branch."},
     )
     
     trainable_mode: str = field(
@@ -190,6 +193,63 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def apply_trainable_mode(model, trainable_mode: str):
+    mode = (trainable_mode or "all").lower()
+    if mode == "all":
+        print("[TRAINABLE_MODE] mode=all; keep original requires_grad settings")
+        return
+
+    if mode != "linear_only":
+        raise ValueError(f"Unsupported trainable_mode: {trainable_mode}")
+
+    frozen_keywords = [
+        "embed",
+        "embed_tokens",
+        "embed_positions",
+        "embedding",
+        "norm",
+        "layernorm",
+        "layer_norm",
+        "lm_head",
+    ]
+
+    for name, param in model.named_parameters():
+        name_lower = name.lower()
+        should_freeze = any(keyword in name_lower for keyword in frozen_keywords)
+        param.requires_grad = not should_freeze
+
+    trainable = []
+    frozen = []
+    trainable_numel = 0
+    frozen_numel = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            trainable.append(name)
+            trainable_numel += param.numel()
+        else:
+            frozen.append(name)
+            frozen_numel += param.numel()
+
+    print("[TRAINABLE_MODE] mode=linear_only")
+    print(f"[TRAINABLE_MODE] trainable parameter tensors: {len(trainable)} ({trainable_numel} params)")
+    print(f"[TRAINABLE_MODE] frozen parameter tensors: {len(frozen)} ({frozen_numel} params)")
+    print("[TRAINABLE_MODE] trainable examples:")
+    for name in trainable[:30]:
+        print(f"  TRAINABLE {name}")
+    print("[TRAINABLE_MODE] frozen examples:")
+    for name in frozen[:30]:
+        print(f"  FROZEN {name}")
+
+    suspicious = [
+        name for name in trainable
+        if any(keyword in name.lower() for keyword in frozen_keywords)
+    ]
+    if suspicious:
+        print("[TRAINABLE_MODE][WARNING] suspicious trainable frozen-like params:")
+        for name in suspicious[:30]:
+            print(f"  WARNING {name}")
     
     
 class Framework:
@@ -198,21 +258,6 @@ class Framework:
         self.args = args
         self.task = task
         self.model, self.tokenizer = self.load_model()
-        
-    def get_max_memory(self, reserve_gb=6, low0_extra_reserve_gb=8):
-        max_memory = {}
-        for i in range(torch.cuda.device_count()):
-            with torch.cuda.device(i):
-                free, total = torch.cuda.mem_get_info()
-            free_gib = int(free / 1024**3)
-    
-            allowed = free_gib - reserve_gb
-            if i == 0:
-                # Keep more room on cuda:0 for input batches, logits, lm_head boundary, CUDA context, etc.
-                allowed -= low0_extra_reserve_gb
-    
-            max_memory[i] = f"{max(1, allowed)}GiB"
-        return max_memory
 
 
     def load_model(self):
@@ -239,7 +284,7 @@ class Framework:
             elif self.args.no_auto_device:
                 # No auto device (use for FSDP)
                 if is_llama:
-                    model = LlamaForCausalLM.from_pretrained(
+                    model = AutoModelForCausalLM.from_pretrained(
                         self.args.model_name if self.args.model_path is None else self.args.model_path,
                         config=config,
                     )
@@ -255,16 +300,13 @@ class Framework:
                     torch_dtype = torch.float16
                 elif self.args.load_bfloat16:
                     torch_dtype = torch.bfloat16
-                max_memory = self.get_max_memory(reserve_gb=8, low0_extra_reserve_gb=28)
-                logger.info(f"[DEVICE_MAP] max_memory = {max_memory}")
-                logger.info(f"[DEVICE_MAP] visible cuda devices = {torch.cuda.device_count()}")
                 if is_llama:
-                    model = LlamaForCausalLM.from_pretrained(
+                    model = AutoModelForCausalLM.from_pretrained(
                         self.args.model_name if self.args.model_path is None else self.args.model_path,
                         config=config,
                         device_map='auto',
                         torch_dtype=torch_dtype,
-                        max_memory=max_memory,
+                        max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
                         load_in_8bit=self.args.load_int8,
                     )
                 else:
@@ -273,16 +315,11 @@ class Framework:
                         config=config,
                         device_map='auto',
                         torch_dtype=torch_dtype,
-                        max_memory=max_memory,
+                        max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
                         load_in_8bit=self.args.load_int8,
                     )
             if is_llama and hasattr(model.config, "use_cache"):
                 model.config.use_cache = False
-                
-            logger.info(f"[DEVICE_MAP] hf_device_map = {getattr(model, 'hf_device_map', None)}")
-            logger.info(f"[DEVICE_MAP] embed_tokens device = {model.model.embed_tokens.weight.device}")
-            logger.info(f"[DEVICE_MAP] lm_head device before diff replace = {model.lm_head.weight.device}")
-            
             model.eval()
             if getattr(config, "model_type", None) == "opt":
                 print("do_layer_norm_before =", model.model.decoder.layers[0].do_layer_norm_before)
@@ -455,115 +492,6 @@ class Framework:
         metric_name = getattr(self.task, "metric_name", "accuracy")
         metrics = {metric_name: calculate_metric(predictions, metric_name)}
         return metrics
-    
-    def _run_device_preflight(self, trainer,raw_eval_samples=None):
-        """
-        Fast multi-device smoke test before real training.
-    
-        It checks:
-        1. one LOZO forward_delta train step if apply_forward_delta=True
-        2. one normal forward / option-loss eval batch
-        3. Check final Framework.evaluate / one_step_pred path.
-        """
-    
-        logger.info("========== DEVICE PREFLIGHT START ==========")
-        logger.info(f"hf_device_map = {getattr(self.model, 'hf_device_map', None)}")
-        logger.info(f"param dtypes = {sorted({str(p.dtype) for p in self.model.parameters()})}")
-        logger.info(f"param devices = {sorted({str(p.device) for p in self.model.parameters()})}")
-    
-        # Preserve RNG state so the smoke test does not affect the actual run too much.
-        py_state = random.getstate()
-        np_state = np.random.get_state()
-        torch_state = torch.random.get_rng_state()
-        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    
-        def _reset_diff_counters_and_caches():
-            # forward_delta modules keep inference_count; reset after preflight.
-            for module in self.model.modules():
-                if hasattr(module, "inference_count"):
-                    module.inference_count = 0
-        
-            # LOZOtrainer caches u/v/z during lowrank_zo_step; clear them after preflight.
-            for name in ["u", "v", "z"]:
-                if hasattr(trainer, name):
-                    obj = getattr(trainer, name)
-                    if isinstance(obj, dict):
-                        obj.clear()
-        
-            # Very important:
-            # lowrank_zo_step uses `hasattr(self, "step")` to decide whether to start from step=0.
-            # If preflight leaves step=0 but clears self.v, the first real training step becomes step=1
-            # and tries to reuse missing self.v[name], causing KeyError.
-            if hasattr(trainer, "step"):
-                delattr(trainer, "step")
-        
-            if hasattr(trainer, "projected_grad"):
-                trainer.projected_grad = None
-        
-            if hasattr(trainer, "zo_random_seed"):
-                delattr(trainer, "zo_random_seed")
-    
-        try:
-            # 1. Check train forward_delta path.
-            if self.args.apply_forward_delta:
-                logger.info("[PREFLIGHT] checking one train batch with lowrank_zo_step / forward_delta ...")
-                train_batch = next(iter(trainer.get_train_dataloader()))
-                loss = trainer.lowrank_zo_step(self.model, train_batch)
-                logger.info(f"[PREFLIGHT] forward_delta train batch OK, loss={float(loss.detach().cpu())}")
-    
-                # lowrank_zo_step should restore params, but it increments counters and fills u/v/z caches.
-                _reset_diff_counters_and_caches()
-            else:
-                logger.info("[PREFLIGHT] skip forward_delta check because apply_forward_delta=False")
-    
-            # 2. Check normal eval forward path.
-            # This covers model(**inputs), wrapped forward_wrap_with_option_len, lm_head, logits/input_ids/labels devices.
-            logger.info("[PREFLIGHT] checking one eval batch with normal forward / compute_loss ...")
-            eval_batch = next(iter(trainer.get_eval_dataloader()))
-            eval_batch = trainer._prepare_inputs(eval_batch)
-    
-            self.model.eval()
-            with torch.inference_mode():
-                with trainer.compute_loss_context_manager():
-                    eval_loss = trainer.compute_loss(self.model, eval_batch)
-    
-            logger.info(f"[PREFLIGHT] normal eval batch OK, loss={float(eval_loss.detach().cpu())}")
-            
-            # 3. Check final Framework.evaluate / one_step_pred path.
-            # This is different from Trainer.evaluate: after training, run_lozo resets
-            # the option-loss wrapper and calls Framework.evaluate([], eval_samples).
-            if raw_eval_samples is not None and len(raw_eval_samples) > 0 and not self.args.no_eval:
-                logger.info("[PREFLIGHT] checking one final-eval style sample via Framework.one_step_pred ...")
-
-                if self.args.only_train_option and not self.args.non_diff and hasattr(self.model, "original_forward"):
-                    saved_forward = self.model.forward
-                    self.model.forward = self.model.original_forward
-                    try:
-                        pred = self.one_step_pred([], raw_eval_samples[0], verbose=False)
-                    finally:
-                        self.model.forward = saved_forward
-                else:
-                    pred = self.one_step_pred([], raw_eval_samples[0], verbose=False)
-
-                logger.info(f"[PREFLIGHT] final-eval style sample OK, pred={pred.predicted_candidate}")
-            else:
-                logger.info("[PREFLIGHT] skip final-eval style sample check")
-                
-        except Exception as e:
-            logger.exception("[PREFLIGHT] FAILED. This usually means a device mismatch or unsupported forward path.")
-            raise
-    
-        finally:
-            _reset_diff_counters_and_caches()
-    
-            # Restore RNG states.
-            random.setstate(py_state)
-            np.random.set_state(np_state)
-            torch.random.set_rng_state(torch_state)
-            if cuda_state is not None:
-                torch.cuda.set_rng_state_all(cuda_state)
-    
-        logger.info("========== DEVICE PREFLIGHT PASSED ==========")
 
 
     def train(self, train_samples, eval_samples):
@@ -662,47 +590,17 @@ class Framework:
             logger.info("replacing nnlayers in model with difflayers")
             uv_provider = trainer.make_uv_provider()
             z_provider = trainer.make_z_provider()
-        
+            
             if self.model.config.model_type == "opt":
-                QuantizeOPTForLOZO(
-                    model=self.model,
-                    mx_w_elem_format=self.args.mx_w_elem_format,
-                    mx_a_elem_format=self.args.mx_a_elem_format,
-                    mx_diffw_elem_format=self.args.mx_diffw_elem_format,
-                    mx_diffa_elem_format=self.args.mx_diffa_elem_format,
-                    enable_w=self.args.enable_w,
-                    enable_x=self.args.enable_x,
-                    enable_diffx=self.args.enable_diffx,
-                    enable_diffw=self.args.enable_diffw,
-                    uv_provider=uv_provider,
-                    z_provider=z_provider,
-                )
-        
-            elif self.model.config.model_type == "llama":
-                if hasattr(self.model.config, "use_cache"):
-                    self.model.config.use_cache = False
-        
-                QuantizeLlamaForLOZO(
-                    model=self.model,
-                    mx_w_elem_format=self.args.mx_w_elem_format,
-                    mx_a_elem_format=self.args.mx_a_elem_format,
-                    mx_diffw_elem_format=self.args.mx_diffw_elem_format,
-                    mx_diffa_elem_format=self.args.mx_diffa_elem_format,
-                    enable_w=self.args.enable_w,
-                    enable_x=self.args.enable_x,
-                    enable_diffx=self.args.enable_diffx,
-                    enable_diffw=self.args.enable_diffw,
-                    uv_provider=uv_provider,
-                    z_provider=z_provider,
-                )
-        
-            else:
-                raise NotImplementedError(
-                    f"apply_forward_delta is not implemented for model_type={self.model.config.model_type}"
-                )
-        
+                QuantizeOPTForLOZO(model=self.model,
+                                       mx_w_elem_format=self.args.mx_w_elem_format, mx_a_elem_format=self.args.mx_a_elem_format, mx_diffw_elem_format=self.args.mx_diffw_elem_format, mx_diffa_elem_format=self.args.mx_diffa_elem_format, 
+                                       enable_w=self.args.enable_w, enable_x=self.args.enable_x, enable_diffx=self.args.enable_diffx, enable_diffw=self.args.enable_diffw, 
+                                       uv_provider=uv_provider, z_provider=z_provider,
+                                       exact_effective_delta=self.args.debug_fd_exact_effective_delta)
             logger.info("Replace All nnLayers with diffLayers to support forward_delta")
-            print(f"model:{self.model}")
+            print(f"model:{self.model}") 
+
+        apply_trainable_mode(self.model, self.args.trainable_mode)
         
         # CheckAgain: if weight tying?
         # w1 = self.model.model.decoder.embed_tokens.weight
@@ -722,12 +620,6 @@ class Framework:
             )
         if self.args.resume_from_checkpoint is not None:
             last_checkpoint = self.args.resume_from_checkpoint
-            
-        if self.args.debug_device_preflight or self.args.debug_device_preflight_only:
-            self._run_device_preflight(trainer, raw_eval_samples=eval_samples)
-        if self.args.debug_device_preflight_only:
-            logger.info("debug_device_preflight_only=True, exiting before trainer.train().")
-            return
 
         # trainer.train(resume_from_checkpoint=last_checkpoint) 
         trainer.train(resume_from_checkpoint=None) 
@@ -830,3 +722,4 @@ def main():
 if __name__ == "__main__": 
     
     main()
+

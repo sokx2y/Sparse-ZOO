@@ -48,8 +48,11 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 
-from .diff_fake_quant_mx import diffLinear, QdiffLinear, diffEmbedding, diffLayerNorm
-
+try:
+    from .diff_fake_quant_mx import diffLinear, QdiffLinear, diffEmbedding, diffLayerNorm
+except ImportError:
+    from diff_fake_quant_mx import diffLinear, QdiffLinear, diffEmbedding, diffLayerNorm
+    
 # from transformers.models.roberta.configuration_roberta import RobertaConfig
 
 import loralib as lora

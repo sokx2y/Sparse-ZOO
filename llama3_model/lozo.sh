@@ -21,7 +21,7 @@ source ~/.bashrc
 # conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/lozo_llama3
 
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
@@ -30,7 +30,7 @@ MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/Llama-3.2-3B}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
-LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"LogPaper"}
+LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"LogPaper32"}
 
 BS=${BS:-16}
 EPS=${EPS:-1e-3}
@@ -49,14 +49,14 @@ elif [ "$MODE" == "lora" ]; then
 fi
 
 LR=2e-7
-TASK=WIC
+TASK=CB
 SEED=0
 RANK=2
 STEP_INTERVAL=100
 Tainer=LOZO
 
 # forward_delta 
-APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-false}
+APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-true}
 ENABLE_X=${ENABLE_X:-true}
 ENABLE_DIFFX=${ENABLE_DIFFX:-true}
 ENABLE_W=${ENABLE_W:-true}
@@ -136,12 +136,14 @@ echo "RANK: $RANK"
 echo "STEP INTERVAL: $STEP_INTERVAL"
 echo "apply_forward_delta": "$APPLY_FORWARD_DELTA"
 
+# --load_float16 \
+# --debug_device_preflight --debug_device_preflight_only \
 python run_lozo.py \
     --model_name $MODEL_NAME --model_path $MODEL\
     --task_name $TASK \
     --output_dir result/$TASK-${MODEL_NAME}-$TAG-${ENABLE} --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
     --max_steps $STEPS \
-    --trainer $Tainer --load_float16 \
+    --trainer $Tainer \
     --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
     --load_best_model_at_end --evaluation_strategy steps --save_strategy steps --save_total_limit 1 \
     --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \

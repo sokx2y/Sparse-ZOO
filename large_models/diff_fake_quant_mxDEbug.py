@@ -24,12 +24,14 @@ class diffLinear(nn.Linear):
         layer_name,
         in_features: int, out_features: int, bias: bool=True, device=None, dtype=None,
         uv_provider=None, z_provider=None,
+        exact_effective_delta: bool = False,
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.inference_count = 0
         self.layer_name = layer_name
         self.uv_provider = uv_provider
         self.z_provider = z_provider
+        self.exact_effective_delta = exact_effective_delta
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input)
@@ -38,6 +40,41 @@ class diffLinear(nn.Linear):
         self.inference_count += 1
         # if self.inference_count == 2:
         #     print(f"input:{input.shape}; layername:{self.layer_name}")
+        if self.exact_effective_delta:
+            output = F.linear(input, self.weight, self.bias)
+            pert_input = (input + diff_input).to(input.dtype)
+
+            weight_minus = self.weight
+            if self.uv_provider is not None:
+                u, v, scale = self.uv_provider(
+                    self.layer_name + ".weight",
+                    self.weight.shape,
+                    self.weight.device,
+                    self.weight.dtype,
+                    self.inference_count,
+                )
+                weight_minus = self.weight.detach().clone()
+                delta_w = torch.matmul(u, v.t())
+                weight_minus.add_(delta_w, alpha=float(scale))
+                weight_minus = weight_minus.to(dtype=self.weight.dtype)
+
+            bias_minus = self.bias
+            if self.z_provider is not None and self.bias is not None:
+                z, bias_scale = self.z_provider(
+                    self.layer_name + ".bias",
+                    self.bias.shape,
+                    self.bias.device,
+                    self.bias.dtype,
+                    self.inference_count,
+                )
+                bias_minus = self.bias.detach().clone()
+                bias_minus.add_(z, alpha=float(bias_scale))
+                bias_minus = bias_minus.to(dtype=self.bias.dtype)
+
+            pert_output = F.linear(pert_input, weight_minus, bias_minus)
+            diff_output = pert_output - output
+            return output, diff_output
+
         output = F.linear(input, self.weight, self.bias)
         diff_output = F.linear(diff_input, self.weight, None)
         if self.uv_provider is not None:
@@ -90,12 +127,14 @@ class QdiffLinear(nn.Linear):
         in_features: int, out_features: int, bias: bool=True, device=None, dtype=None,  
         mx_w_elem_format=None, mx_a_elem_format=None, mx_diffw_elem_format=None, mx_diffa_elem_format=None,
         uv_provider=None, z_provider=None,
+        exact_effective_delta: bool = False,
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
         self.inference_count = 0
         self.layer_name = layer_name
         self.uv_provider = uv_provider
         self.z_provider = z_provider
+        self.exact_effective_delta = exact_effective_delta
         
         self.enable_x = enable_x
         self.enable_diffx = enable_diffx
@@ -158,6 +197,8 @@ class QdiffLinear(nn.Linear):
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor) -> torch.Tensor:
         self.inference_count += 1
+        if self.exact_effective_delta:
+            raise NotImplementedError("exact effective delta debug mode only supports non-quantized diffLinear path")
         print(f"{input.shape}")
         # ground state output
         output = mx_linear(input, self.weight, self.bias, mx_specs=self.mx_specs0)
@@ -214,6 +255,7 @@ class diffEmbedding(nn.Embedding):
                  num_embeddings: int, embedding_dim: int, 
                  padding_idx: Optional[int] = None, max_norm: Optional[float] = None, norm_type: float = 2.0, scale_grad_by_freq: bool = False, sparse: bool = False,
                  layer_name: str = "", uv_provider = None,
+                 exact_effective_delta: bool = False,
                  device=None, dtype=None,
                  ):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -230,6 +272,7 @@ class diffEmbedding(nn.Embedding):
         self.layer_name = layer_name           
         self.uv_provider = uv_provider         
         self.inference_count = 0    
+        self.exact_effective_delta = exact_effective_delta
         
     def forward(self, input: torch.LongTensor) -> torch.Tensor:
         return super().forward(input)           
@@ -258,6 +301,12 @@ class diffEmbedding(nn.Embedding):
         )
         # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_u[0]:{u[0]}, fake_v[0]:{v[0]}")
         u_rows = u[input]                      # [B, T, r]
+        if self.exact_effective_delta:
+            delta_rows = torch.matmul(u_rows, v.t()) * scale
+            pert_output = (output + delta_rows).to(dtype=output.dtype)
+            diff_output = pert_output - output
+            return output, diff_output
+
         diff_output = torch.matmul(u_rows, v.t()) * scale
         
         return output, diff_output
@@ -274,12 +323,14 @@ class diffLayerNorm(nn.LayerNorm):
     def __init__(self, 
                  normalized_shape: Union[int, Tuple[int, ...]], eps: float = 1e-5, elementwise_affine: bool = True,
                  layer_name: str = "", z_provider=None, 
+                 exact_effective_delta: bool = False,
                  device=None, dtype=None,):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__(normalized_shape, eps=eps, elementwise_affine=elementwise_affine, **factory_kwargs,)
         self.layer_name = layer_name
         self.z_provider = z_provider
         self.inference_count = 0
+        self.exact_effective_delta = exact_effective_delta
         
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input)   
@@ -309,6 +360,10 @@ class diffLayerNorm(nn.LayerNorm):
                     self.inference_count,
                 )
                 weight_1 = weight + z_w * scale_w  # γ_new = γ + Δγ
+                if self.exact_effective_delta:
+                    weight_1 = weight.detach().clone()
+                    weight_1.add_(z_w, alpha=float(scale_w))
+                    weight_1 = weight_1.to(dtype=weight.dtype)
                 # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z_w[0]:{z_w[0]}")
             if bias is not None:
                 b_name = self.layer_name + ".bias" if self.layer_name else "bias"
@@ -320,12 +375,68 @@ class diffLayerNorm(nn.LayerNorm):
                     self.inference_count,
                 )
                 bias_1 = bias + z_b * scale_b      # β_new = β + Δβ
+                if self.exact_effective_delta:
+                    bias_1 = bias.detach().clone()
+                    bias_1.add_(z_b, alpha=float(scale_b))
+                    bias_1 = bias_1.to(dtype=bias.dtype)
                 # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z_b[0]:{z_b[0]}")
         output_1 = F.layer_norm(input_1, self.normalized_shape, weight_1, bias_1, self.eps)
         diff_output = output_1 - output
         
         return output, diff_output
             
+
+class diffLlamaRMSNorm(nn.Module):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-6,
+        layer_name="",
+        z_provider=None,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, device=device, dtype=dtype))
+        self.variance_epsilon = eps
+        self.layer_name = layer_name
+        self.z_provider = z_provider
+        self.inference_count = 0
+
+    def _rms_norm(self, hidden_states: torch.Tensor, weight: torch.Tensor):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return weight * hidden_states.to(input_dtype)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self._rms_norm(hidden_states, self.weight)
+
+    def forward_delta(self, hidden_states: torch.Tensor, diff_hidden_states: torch.Tensor):
+        self.inference_count += 1
+        output = self.forward(hidden_states)
+
+        input_1 = hidden_states + diff_hidden_states
+        weight_1 = self.weight
+        if self.z_provider is not None:
+            z, scale = self.z_provider(
+                self.layer_name + ".weight",
+                self.weight.shape,
+                self.weight.device,
+                self.weight.dtype,
+                self.inference_count,
+            )
+            weight_1 = self.weight + z * scale
+
+        output_1 = self._rms_norm(input_1, weight_1)
+        diff_output = output_1 - output
+
+        return output, diff_output
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
 
 def get_all_QdiffLinear(model: nn.Module):
     QdiffLinears = []    
@@ -338,6 +449,17 @@ def get_all_QdiffLinear(model: nn.Module):
             
     find_linears(model)
     return QdiffLinears
+
+def get_all_diffLinear(model: nn.Module):
+    diffLinears = []
+    def find_linears(module):
+        for child in module.children():
+            if isinstance(child, diffLinear):
+                diffLinears.append(child)
+            find_linears(child)
+
+    find_linears(model)
+    return diffLinears
 
 def get_all_diffEmbedding(model: nn.Module):
     diff_embs = []
@@ -359,6 +481,17 @@ def get_all_diffLayerNorm(model: nn.Module):
             find_LayerNorm(child)
 
     find_LayerNorm(model)
+    return diff_norm
+
+def get_all_diffLlamaRMSNorm(model: nn.Module):
+    diff_norm = []
+    def find_LlamaRMSNorm(module: nn.Module):
+        for child in module.children():
+            if isinstance(child, diffLlamaRMSNorm):
+                diff_norm.append(child)
+            find_LlamaRMSNorm(child)
+
+    find_LlamaRMSNorm(model)
     return diff_norm
 
 # ---------------------------------------------------------------------
@@ -497,6 +630,7 @@ def QuantizeOPTForLOZO(
     model: nn.Module,
     mx_w_elem_format=None, mx_a_elem_format=None, mx_diffw_elem_format=None, mx_diffa_elem_format=None,
     uv_provider=None, z_provider=None,
+    exact_effective_delta: bool = False,
 ):
 
     def replace_opt_module(module, prefix=""):
@@ -525,12 +659,32 @@ def QuantizeOPTForLOZO(
                     sparse=child.sparse,
                     layer_name=full_name,
                     uv_provider=uv_provider,
+                    exact_effective_delta=exact_effective_delta,
                     device="meta",                 
                     dtype=child.weight.dtype,
                 )
                 new_emb.weight = child.weight
                 setattr(module, name, new_emb)
                 # print(f"Replace {full_name} with diffEmbedding (share weight)")
+                continue
+
+            if exact_effective_delta and in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+                new_head = diffLinear(
+                    layer_name=full_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                    exact_effective_delta=exact_effective_delta,
+                )
+                new_head.weight = child.weight
+                if child.bias is not None:
+                    new_head.bias = child.bias
+                setattr(module, name, new_head)
+                print(f"Replace {full_name} with diffLinear exact-effective (share params)")
                 continue
 
             if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, QdiffLinear):
@@ -551,6 +705,7 @@ def QuantizeOPTForLOZO(
                     mx_diffa_elem_format=mx_diffa_elem_format,
                     uv_provider=uv_provider,
                     z_provider=z_provider,
+                    exact_effective_delta=exact_effective_delta,
                 )
                 new_qlinear.weight = child.weight
                 if child.bias is not None:
@@ -558,6 +713,7 @@ def QuantizeOPTForLOZO(
                 setattr(module, name, new_qlinear)
                 print(f"Replace {full_name} with QdiffLinear (share params)")
                 continue
+            
             # if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
             #     new_head = diffLinear(
             #         layer_name=full_name,
@@ -586,6 +742,7 @@ def QuantizeOPTForLOZO(
                     dtype=child.weight.dtype,
                     uv_provider=uv_provider,
                     z_provider=z_provider,
+                    exact_effective_delta=exact_effective_delta,
                 )
                 new_head.weight = child.weight
                 if child.bias is not None:
@@ -604,6 +761,7 @@ def QuantizeOPTForLOZO(
                     dtype=child.weight.dtype,
                     uv_provider=uv_provider,
                     z_provider=z_provider,
+                    exact_effective_delta=exact_effective_delta,
                 )
                 new_head.weight = child.weight
                 if child.bias is not None:
@@ -619,6 +777,7 @@ def QuantizeOPTForLOZO(
                     elementwise_affine=child.elementwise_affine,
                     layer_name=full_name,
                     z_provider=z_provider,
+                    exact_effective_delta=exact_effective_delta,
                     device="meta",              
                     dtype=child.weight.dtype if child.weight is not None else None,
                 )
@@ -651,3 +810,140 @@ def QuantizeOPTForLOZO(
         print(model)
     else:
         print("Model is not an OPT model, skip QuantizeOPTForLOZO.")
+
+
+def QuantizeLlamaForLOZO(
+    enable_w, enable_x, enable_diffw, enable_diffx,
+    model: nn.Module,
+    mx_w_elem_format=None,
+    mx_a_elem_format=None,
+    mx_diffw_elem_format=None,
+    mx_diffa_elem_format=None,
+    uv_provider=None,
+    z_provider=None,
+):
+    def replace_llama_module(module, prefix=""):
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+
+            is_embed_tokens = (full_name == "model.embed_tokens")
+            in_decoder_layers = full_name.startswith("model.layers")
+            is_lm_head = (full_name == "lm_head")
+
+            if is_embed_tokens and isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
+                new_emb = diffEmbedding(
+                    num_embeddings=child.num_embeddings,
+                    embedding_dim=child.embedding_dim,
+                    padding_idx=child.padding_idx,
+                    max_norm=child.max_norm,
+                    norm_type=child.norm_type,
+                    scale_grad_by_freq=child.scale_grad_by_freq,
+                    sparse=child.sparse,
+                    layer_name=full_name,
+                    uv_provider=uv_provider,
+                    device="meta",
+                    dtype=child.weight.dtype,
+                )
+                new_emb.weight = child.weight
+                setattr(module, name, new_emb)
+                print(f"Replace {full_name} with diffEmbedding")
+                continue
+
+            if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, (diffLinear, QdiffLinear)):
+                new_linear = diffLinear(
+                    layer_name=full_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_linear.weight = child.weight
+                if child.bias is not None:
+                    new_linear.bias = child.bias
+                setattr(module, name, new_linear)
+                print(f"Replace decoder linear {full_name} with diffLinear")
+                continue
+                # new_qlinear = QdiffLinear(
+                #     enable_x=enable_x,
+                #     enable_diffx=enable_diffx,
+                #     enable_w=enable_w,
+                #     enable_diffw=enable_diffw,
+                #     layer_name=full_name,
+                #     in_features=child.in_features,
+                #     out_features=child.out_features,
+                #     bias=(child.bias is not None),
+                #     device="meta",
+                #     dtype=child.weight.dtype,
+                #     mx_w_elem_format=mx_w_elem_format,
+                #     mx_a_elem_format=mx_a_elem_format,
+                #     mx_diffw_elem_format=mx_diffw_elem_format,
+                #     mx_diffa_elem_format=mx_diffa_elem_format,
+                #     uv_provider=uv_provider,
+                #     z_provider=z_provider,
+                # )
+                # new_qlinear.weight = child.weight
+                # if child.bias is not None:
+                #     new_qlinear.bias = child.bias
+                # setattr(module, name, new_qlinear)
+                # print(f"Replace decoder linear {full_name} with QdiffLinear")
+                # continue
+
+            # lm_head Linear:
+            # Always use diffLinear for now.
+            if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+                provider_layer_name = full_name
+
+                try:
+                    if (
+                        hasattr(model, "model")
+                        and hasattr(model.model, "embed_tokens")
+                        and child.weight is model.model.embed_tokens.weight
+                    ):
+                        provider_layer_name = "model.embed_tokens"
+                except Exception:
+                    provider_layer_name = full_name
+
+                new_head = diffLinear(
+                    layer_name=provider_layer_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_head.weight = child.weight
+                if child.bias is not None:
+                    new_head.bias = child.bias
+                setattr(module, name, new_head)
+                print(
+                    f"Replace {full_name} with diffLinear, "
+                    f"provider layer_name={provider_layer_name}"
+                )
+                continue
+
+            if child.__class__.__name__ == "LlamaRMSNorm":
+                new_norm = diffLlamaRMSNorm(
+                    hidden_size=child.weight.shape[0],
+                    eps=child.variance_epsilon,
+                    layer_name=full_name,
+                    z_provider=z_provider,
+                    device="meta",
+                    dtype=child.weight.dtype,
+                )
+                new_norm.weight = child.weight
+                setattr(module, name, new_norm)
+                print(f"Replace {full_name} with diffLlamaRMSNorm")
+                continue
+
+            # Recurse into child modules
+            replace_llama_module(child, full_name)
+
+    if getattr(model, "config", None) is not None and model.config.model_type == "llama":
+        replace_llama_module(model)
+    else:
+        print("Model is not a Llama model, skip QuantizeLlamaForLOZO.")

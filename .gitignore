@@ -10,6 +10,7 @@ medium_models/result/*
 medium_models/custom_linear_plots/*# experiment outputs / checkpoints
 large_models/result/
 medium_models/result/
+llama3_model/result/
 **/checkpoint-*/
 *.bin
 *.pt
