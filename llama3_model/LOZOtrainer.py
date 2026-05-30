@@ -1060,6 +1060,12 @@ class LowRankTrainer(Trainer):
         """
         def provider(param_name, shape, device, dtype, inference_count):
             if not hasattr(self, "z") or param_name not in self.z:
+                if (
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return torch.zeros(shape, device=device, dtype=dtype), 0.0
                 keys = list(self.z.keys())[:20] if hasattr(self, "z") else []
                 raise RuntimeError(
                     f"[FD_PROVIDER_MISS][z] param_name={param_name}, "
@@ -1079,6 +1085,16 @@ class LowRankTrainer(Trainer):
         """
         def provider(param_name, shape, device, dtype, inference_count):
             if not hasattr(self, "u") or param_name not in self.u:
+                if (
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return (
+                        torch.zeros(shape[0], 1, device=device, dtype=dtype),
+                        torch.zeros(shape[1], 1, device=device, dtype=dtype),
+                        0.0,
+                    )
                 keys = list(self.u.keys())[:20] if hasattr(self, "u") else []
                 raise RuntimeError(
                     f"[FD_PROVIDER_MISS][u] param_name={param_name}, "
@@ -1087,6 +1103,16 @@ class LowRankTrainer(Trainer):
                 )
     
             if not hasattr(self, "v") or param_name not in self.v:
+                if (
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return (
+                        torch.zeros(shape[0], 1, device=device, dtype=dtype),
+                        torch.zeros(shape[1], 1, device=device, dtype=dtype),
+                        0.0,
+                    )
                 keys = list(self.v.keys())[:20] if hasattr(self, "v") else []
                 raise RuntimeError(
                     f"[FD_PROVIDER_MISS][v] param_name={param_name}, "
@@ -1187,12 +1213,29 @@ class LowRankTrainer(Trainer):
             self.v = {}
 
         self.named_parameters_to_optim = []
+        self.all_parameter_names = set()
+        self.trainable_parameter_names = set()
         for name, param in model.named_parameters():
+            self.all_parameter_names.add(name)
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
+                self.trainable_parameter_names.add(name)
 
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
+        
+        if self.step < 5:
+            x = inputs["input_ids"]
+            print(
+                "[STEP-CHECK]",
+                "step=", self.step,
+                "zo_seed=", getattr(self, "zo_random_seed", None),
+                "shape=", tuple(x.shape),
+                "sum=", int(x.sum().item()),
+                "tail=", x[0, -16:].detach().cpu().tolist(),
+                flush=True,
+            )
+            print("[ZO-SEED]", self.step, self.zo_random_seed, flush=True)
         
         # debug minibatch 
         # if self.step == 0:
@@ -1335,7 +1378,7 @@ class LowRankTrainer(Trainer):
                     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
 
         self.lr_scheduler.step()
-        
+
     def random_gaussian_matrix(self, m, n, device, dtype, random_seed=None):
         if random_seed is not None:
             torch.manual_seed(random_seed)

@@ -9,6 +9,8 @@ import random
 from typing import Optional
 from typing import Union, Tuple
 
+from forward_delta_debug import record_forward_delta_profile
+
 try:
     from mx.specs import MxSpecs,finalize_mx_specs
     from mx.linear import linear as mx_linear  
@@ -30,6 +32,7 @@ class diffLinear(nn.Linear):
         self.layer_name = layer_name
         self.uv_provider = uv_provider
         self.z_provider = z_provider
+        self.outlier_profiler = None
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input)
@@ -48,6 +51,17 @@ class diffLinear(nn.Linear):
                 self.weight.dtype,
                 self.inference_count
             )
+            if self.outlier_profiler is not None and self.inference_count == 30:
+                self.outlier_profiler.record_forward_delta(
+                    self.layer_name,
+                    self,
+                    input,
+                    diff_input,
+                    u=u,
+                    v=v,
+                    scale=scale,
+                    call_id=self.inference_count,
+                )
             # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_u[0]:{u[0]}, fake_v[0]:{v[0]}")
             out_dim = diff_output.size(-1)
             r = v.size(-1)
@@ -60,6 +74,14 @@ class diffLinear(nn.Linear):
             tmp = input.reshape(-1, v.size(0)).matmul(v)       
             diff_out_2d.addmm_(tmp, u.t(), beta=1.0, alpha=scale)
             diff_output = diff_out_2d.view_as(diff_output)
+        elif self.outlier_profiler is not None and self.inference_count == 30:
+            self.outlier_profiler.record_forward_delta(
+                self.layer_name,
+                self,
+                input,
+                diff_input,
+                call_id=self.inference_count,
+            )
 
         if self.z_provider is not None and (self.bias is not None):
             z, bias_scale = self.z_provider(
@@ -73,7 +95,14 @@ class diffLinear(nn.Linear):
             diff_bias = z * bias_scale  # [out]
             view_shape = [1] * (diff_output.dim() - 1) + [-1]
             diff_output.add_(diff_bias.view(*view_shape))
-            
+        record_forward_delta_profile(
+            "standard",
+            self.layer_name,
+            self,
+            self.inference_count,
+            output,
+            diff_output,
+        )
         return output, diff_output
     
     
@@ -96,6 +125,8 @@ class QdiffLinear(nn.Linear):
         self.layer_name = layer_name
         self.uv_provider = uv_provider
         self.z_provider = z_provider
+        
+        self.perturb_distribution_profiler = None
         
         self.enable_x = enable_x
         self.enable_diffx = enable_diffx
@@ -158,7 +189,7 @@ class QdiffLinear(nn.Linear):
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor) -> torch.Tensor:
         self.inference_count += 1
-        print(f"{input.shape}")
+        # print(f"{input.shape}")
         # ground state output
         output = mx_linear(input, self.weight, self.bias, mx_specs=self.mx_specs0)
         
@@ -170,6 +201,15 @@ class QdiffLinear(nn.Linear):
                                self.weight.device,
                                self.weight.dtype,
                                self.inference_count)
+            if self.perturb_distribution_profiler is not None:
+                self.perturb_distribution_profiler.record_forward_delta(
+                    self.layer_name,
+                    self,
+                    u=u,
+                    v=v,
+                    scale=scale,
+                    call_id=self.inference_count,
+                )
             # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_u[0]:{u[0]}, fake_v[0]:{v[0]}")
             tmp = mx_linear(input, v.t(), None, mx_specs=self.mx_specs2)
             diff_weight_output = mx_linear(tmp, u, None, mx_specs=self.mx_specs2)
@@ -199,6 +239,14 @@ class QdiffLinear(nn.Linear):
         
         diff_output = diff_act_output + diff_weight_output + diff_bias
         # diff_output = diff_act_output + diff_weight_output + diff_bias
+        record_forward_delta_profile(
+            "standard_quant",
+            self.layer_name,
+            self,
+            self.inference_count,
+            output,
+            diff_output,
+        )
         
         return output, diff_output
     
@@ -863,3 +911,4 @@ def QuantizeLlamaForLOZO(
         replace_llama_module(model)
     else:
         print("Model is not a Llama model, skip QuantizeLlamaForLOZO.")
+

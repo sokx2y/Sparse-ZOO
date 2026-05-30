@@ -914,6 +914,19 @@ class LowRankTrainer(Trainer):
 
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
+        
+        if self.step < 5:
+            x = inputs["input_ids"]
+            print(
+                "[STEP-CHECK]",
+                "step=", self.step,
+                "zo_seed=", getattr(self, "zo_random_seed", None),
+                "shape=", tuple(x.shape),
+                "sum=", int(x.sum().item()),
+                "tail=", x[0, -16:].detach().cpu().tolist(),
+                flush=True,
+            )
+            print("[ZO-SEED]", self.step, self.zo_random_seed, flush=True)
 
         # First function evaluation
         self.lowrank_zo_perturb_parameters(scaling_factor=1)

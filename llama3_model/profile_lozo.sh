@@ -13,7 +13,7 @@ conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/lozo_llama3
 
 
 # 只覆盖 lozo.sh 里支持 ${VAR:-default} 的变量
-export LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"testprofile"}
+export LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"testprofileSVD"}
 
 # export MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/opt-13b}
 MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/Llama-3.2-3B}
@@ -28,7 +28,7 @@ export TRAIN=${TRAIN:-32}
 export DEV=${DEV:-16}
 export EVAL=${EVAL:-64}
 
-export STEPS=${STEPS:-50}
+export STEPS=${STEPS:-100}
 export EVAL_STEPS=${EVAL_STEPS:-10}
 
 

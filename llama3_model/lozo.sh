@@ -21,7 +21,7 @@ source ~/.bashrc
 # conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/lozo_llama3
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=5
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
@@ -30,7 +30,7 @@ MODEL=${MODEL:-/capsule/home/xiangyuxing/hf_offline/Llama-3.2-3B}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
 
-LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"LogPaper32"}
+LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"LogPaperSVD"}
 
 BS=${BS:-16}
 EPS=${EPS:-1e-3}
@@ -48,12 +48,29 @@ elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
 
-LR=2e-7
-TASK=CB
+# LR=2e-7
+TASK=RTE
 SEED=0
 RANK=2
 STEP_INTERVAL=100
 Tainer=LOZO
+
+
+# export LOZO_FD_PROFILE=1
+# export LOZO_FD_PROFILE_CALLS=1,10,20,30,40,50
+# export LOZO_FD_PROFILE_DIR=debug_fd_standard
+# export LOZO_FD_PROFILE=1
+# export LOZO_SVD_TERM_PROFILE=1
+# export LOZO_FD_PROFILE_CALLS=1,10,20,30,40,50
+# export LOZO_FD_PROFILE_DIR=debug_fd_svd
+# if svd_lora
+LR=1e-6
+svd_lora_compensation=true
+svd_lora_act_scales_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/fp16_llama3_actscales/act_scales.pt
+svd_lora_smooth_alpha=0.5
+svd_lora_checkpoint_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/llama3_residual_float16_svd_rank8_1.0
+svd_lora_rank=8
+svd_lora_quant_format=none
 
 # forward_delta 
 APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-true}
@@ -64,7 +81,7 @@ ENABLE_DIFFW=${ENABLE_DIFFW:-true}
 MX_A_ELEM_FORMAT=${MX_A_ELEM_FORMAT:-"fp8_e4m3"}
 MX_DIFFA_ELEM_FORMAT=${MX_DIFFA_ELEM_FORMAT:-"fp4_e2m1"}
 MX_W_ELEM_FORMAT=${MX_W_ELEM_FORMAT:-"fp8_e4m3"}
-MX_DIFFW_ELEM_FORMAT=${MX_DIFFW_ELEM_FORMAT:-"fp4_e2m1"}
+MX_DIFFW_ELEM_FORMAT=${MX_DIFFW_ELEM_FORMAT:-"fp8_e4m3"}
 
 TRAINABLE_MODE=${TRAINABLE_MODE:-"all"}
 
@@ -136,8 +153,7 @@ echo "RANK: $RANK"
 echo "STEP INTERVAL: $STEP_INTERVAL"
 echo "apply_forward_delta": "$APPLY_FORWARD_DELTA"
 
-# --load_float16 \
-# --debug_device_preflight --debug_device_preflight_only \
+
 python run_lozo.py \
     --model_name $MODEL_NAME --model_path $MODEL\
     --task_name $TASK \
@@ -152,10 +168,23 @@ python run_lozo.py \
     --rank_r $RANK \
     --apply_forward_delta $APPLY_FORWARD_DELTA --trainable_mode $TRAINABLE_MODE\
     --mx_w_elem_format $MX_W_ELEM_FORMAT --mx_a_elem_format $MX_A_ELEM_FORMAT --mx_diffw_elem_format $MX_DIFFW_ELEM_FORMAT --mx_diffa_elem_format $MX_DIFFA_ELEM_FORMAT --enable_x $ENABLE_X --enable_diffx $ENABLE_DIFFX --enable_w $ENABLE_W --enable_diffw $ENABLE_DIFFW \
+    --load_float16 \
+    --svd_lora_compensation $svd_lora_compensation --svd_lora_act_scales_path $svd_lora_act_scales_path --svd_lora_smooth_alpha $svd_lora_smooth_alpha \
+    --svd_lora_checkpoint_path $svd_lora_checkpoint_path --svd_lora_rank $svd_lora_rank --svd_lora_quant_format $svd_lora_quant_format \
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@" 
 
+
+# --debug_device_preflight --debug_device_preflight_only \
+# --profile_linear True \
+# --profile_linear_dir linear_profile_llama32_sst2_step30 \
+# --profile_linear_max_calls_per_layer 1 \
+# --profile_linear_block_size 16 \
+# --profile_linear_token_stride 1 \
+# --profile_linear_channel_stride 8 \
+# --profile_linear_weight_stride 16 \
+# --profile_linear_layer_regex "model.layers.(0|7|14|21|27).*(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)"
 
 
 
