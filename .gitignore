@@ -11,6 +11,7 @@ medium_models/custom_linear_plots/*# experiment outputs / checkpoints
 large_models/result/
 medium_models/result/
 llama3_model/result/
+llama3_model/profile_data_pictures/
 **/checkpoint-*/
 *.bin
 *.pt
@@ -19,3 +20,4 @@ llama3_model/result/
 *.log
 wandb/
 runs/
+

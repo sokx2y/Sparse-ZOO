@@ -26,26 +26,34 @@ try:
     from smoothquant.fake_quant import (
         _quantize_groupwise_fp,
         quantize_activation_mxfp4,
+        quantize_activation_mxfp8,
         quantize_activation_nvfp4,
+        quantize_activation_nvfp8,
         quantize_weight_mxint4,
         quantize_weight_mxfp4,
+        quantize_weight_mxfp8,
         quantize_weight_nvint4,
         quantize_weight_nvfp4,
+        quantize_weight_nvfp8,
     )
 except Exception:
     _quantize_groupwise_fp = None
     quantize_activation_mxfp4 = None
+    quantize_activation_mxfp8 = None
     quantize_activation_nvfp4 = None
+    quantize_activation_nvfp8 = None
     quantize_weight_mxint4 = None
     quantize_weight_mxfp4 = None
+    quantize_weight_mxfp8 = None
     quantize_weight_nvint4 = None
     quantize_weight_nvfp4 = None
+    quantize_weight_nvfp8 = None
 
 
 def svd_lora_output(input: torch.Tensor, u: Optional[torch.Tensor], v: Optional[torch.Tensor]):
     if u is None or v is None:
         return None
-    flat = input.reshape(-1, input.shape[-1])
+    flat = input.reshape(-1, input.shape[-1]).to(dtype=v.dtype)
     out = flat.matmul(v).matmul(u.t())
     return out.view(*input.shape[:-1], u.shape[0])
 
@@ -63,11 +71,19 @@ def lowrank_direction_from_provider(provider, param_name, param, inference_count
     return left.matmul(right.t()), scale
 
 
+def quantize_svd_lora_factor_nvfp8(tensor: Optional[torch.Tensor]):
+    if tensor is None:
+        return None
+    if quantize_weight_nvfp8 is None:
+        raise RuntimeError("SVD-LoRA factor FP8 quantization requires smoothquant.fake_quant to be importable")
+    return quantize_weight_nvfp8(tensor, group_size=None)
+
+
 def default_group_size_for_format(quant_format: Optional[str]):
     quant_format = (quant_format or "none").lower()
-    if quant_format in {"nvint4", "nvfp4"}:
+    if quant_format in {"nvint4", "nvfp4", "nvfp8"}:
         return 16
-    if quant_format in {"mxint4", "mxfp4"}:
+    if quant_format in {"mxint4", "mxfp4", "mxfp8"}:
         return 32
     return None
 
@@ -122,6 +138,8 @@ def activation_quantizers_from_format(quant_format: Optional[str], group_size: O
     if backend == "nv":
         if quantize_activation_nvfp4 is None:
             raise RuntimeError("nvfp4 activation quantization requires smoothquant.fake_quant to be importable")
+        if quant_format == "nvfp8" and quantize_activation_nvfp8 is None:
+            raise RuntimeError("nvfp8 activation quantization requires smoothquant.fake_quant to be importable")
         return (
             lambda x: quantize_activation_nvfp8(x, group_size=group_size),
             lambda x: quantize_activation_nvfp4(x, group_size=group_size),
@@ -129,6 +147,8 @@ def activation_quantizers_from_format(quant_format: Optional[str], group_size: O
     if backend == "mx":
         if quantize_activation_mxfp4 is None:
             raise RuntimeError("mxfp4 activation quantization requires smoothquant.fake_quant to be importable")
+        if quant_format == "mxfp8" and quantize_activation_mxfp8 is None:
+            raise RuntimeError("mxfp8 activation quantization requires smoothquant.fake_quant to be importable")
         return (
             lambda x: quantize_activation_mxfp8(x, group_size=group_size),
             lambda x: quantize_activation_mxfp4(x, group_size=group_size),
@@ -144,25 +164,37 @@ def quantize_frozen_base_weight(weight: torch.Tensor, quant_format: Optional[str
     if quant_format == "nvint4":
         if quantize_weight_nvint4 is None:
             raise RuntimeError("nvint4 requires smoothquant.fake_quant to be importable")
-        return quantize_weight_nvint4(weight.detach().cpu(), group_size=group_size).to(
+        return quantize_weight_nvint4(weight.detach(), group_size=group_size).to(
             device=weight.device, dtype=weight.dtype
         )
     if quant_format == "nvfp4":
         if quantize_weight_nvfp4 is None:
             raise RuntimeError("nvfp4 requires smoothquant.fake_quant to be importable")
-        return quantize_weight_nvfp4(weight.detach().cpu(), group_size=group_size).to(
+        return quantize_weight_nvfp4(weight.detach(), group_size=group_size).to(
+            device=weight.device, dtype=weight.dtype
+        )
+    if quant_format == "nvfp8":
+        if quantize_weight_nvfp8 is None:
+            raise RuntimeError("nvfp8 requires smoothquant.fake_quant to be importable")
+        return quantize_weight_nvfp8(weight.detach(), group_size=group_size).to(
             device=weight.device, dtype=weight.dtype
         )
     if quant_format == "mxint4":
         if quantize_weight_mxint4 is None:
             raise RuntimeError("mxint4 requires smoothquant.fake_quant to be importable")
-        return quantize_weight_mxint4(weight.detach().cpu(), group_size=group_size).to(
+        return quantize_weight_mxint4(weight.detach(), group_size=group_size).to(
             device=weight.device, dtype=weight.dtype
         )
     if quant_format == "mxfp4":
         if quantize_weight_mxfp4 is None:
             raise RuntimeError("mxfp4 requires smoothquant.fake_quant to be importable")
-        return quantize_weight_mxfp4(weight.detach().cpu(), group_size=group_size).to(
+        return quantize_weight_mxfp4(weight.detach(), group_size=group_size).to(
+            device=weight.device, dtype=weight.dtype
+        )
+    if quant_format == "mxfp8":
+        if quantize_weight_mxfp8 is None:
+            raise RuntimeError("mxfp8 requires smoothquant.fake_quant to be importable")
+        return quantize_weight_mxfp8(weight.detach(), group_size=group_size).to(
             device=weight.device, dtype=weight.dtype
         )
     raise ValueError(f"Unsupported frozen base quant format: {quant_format}")
@@ -172,9 +204,9 @@ def quant_backend_from_format(quant_format: Optional[str]):
     quant_format = (quant_format or "none").lower()
     if quant_format in {"none", "fp", "fp16", "fp32"}:
         return "none"
-    if quant_format in {"nvint4", "nvfp4"}:
+    if quant_format in {"nvint4", "nvfp4", "nvfp8"}:
         return "nv"
-    if quant_format in {"mxint4", "mxfp4"}:
+    if quant_format in {"mxint4", "mxfp4", "mxfp8"}:
         return "mx"
     raise ValueError(f"Unsupported SVD-LoRA quant_format: {quant_format}")
 
@@ -238,8 +270,7 @@ def set_svd_lora(
 def svd_lora_forward_delta(module, input, diff_input):
     u = getattr(module, "svd_lora_u", None)
     v = getattr(module, "svd_lora_v", None)
-    plus = svd_lora_output(input, u, v)
-    if plus is None:
+    if u is None or v is None:
         return None, None
 
     du, u_scale = lowrank_direction_from_provider(
@@ -254,6 +285,16 @@ def svd_lora_forward_delta(module, input, diff_input):
         v,
         module.inference_count,
     )
+    if getattr(module, "quantize_svd_lora_factors_fp8", False):
+        # QdiffSVDLinear locally FP8-quantizes U/V/dU/dV before SVD-LoRA forward-delta math.
+        u = quantize_svd_lora_factor_nvfp8(u)
+        v = quantize_svd_lora_factor_nvfp8(v)
+        du = quantize_svd_lora_factor_nvfp8(du)
+        dv = quantize_svd_lora_factor_nvfp8(dv)
+
+    plus = svd_lora_output(input, u, v)
+    if plus is None:
+        return None, None
     if du is None and dv is None:
         svd_diff = svd_lora_output(diff_input, u, v)
         if svd_term_profile_enabled(module.inference_count):
@@ -360,7 +401,8 @@ class QdiffSVDLinear(nn.Linear):
         dtype=None,
         uv_provider=None,
         z_provider=None,
-        quant_format: str = "nvfp4",
+        quant_format: str = "nvfp8",
+        quant_format_wdx: Optional[str] = None,
         group_size: int = 0,
     ):
         super().__init__(in_features, out_features, bias, device, dtype)
@@ -371,7 +413,13 @@ class QdiffSVDLinear(nn.Linear):
         self.outlier_profiler = None
         self.perturb_distribution_profiler = None
         self.quant_format = (quant_format or "none").lower()
+        self.quant_format_wdx = (quant_format_wdx or "none").lower()
+        # self.quantize_svd_lora_factors_fp8 = True
+        self.quantize_svd_lora_factors_fp8 = False
+        # usually, we can keep group_size = 0 and use _effective_group_size to decide self.group-size automatically.
         self.group_size = _effective_group_size(self.quant_format, group_size)
+        self.group_size_wdx = _effective_group_size(self.quant_format_wdx, group_size)
+        # activation_quantizers_from_format func always keep x->fp8, dx->fp4 in this version.
         self.act_quant, self.diff_act_quant = activation_quantizers_from_format(
             self.quant_format,
             self.group_size,
@@ -380,7 +428,7 @@ class QdiffSVDLinear(nn.Linear):
     def _base_linear(self, input, weight=None, bias=None, specs=None):
         del specs
         weight = self.weight if weight is None else weight
-        return F.linear(input, weight, bias)
+        return F.linear(input.to(dtype=weight.dtype), weight, bias)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         input_q = self.act_quant(input)
@@ -401,7 +449,12 @@ class QdiffSVDLinear(nn.Linear):
         if svd_output is not None:
             output = output + svd_output
 
-        diff_output = F.linear(diff_input_q, self.weight, None)
+        weight_wdx = (
+            self.weight
+            if self.quant_format_wdx in {"", "none"}
+            else quantize_frozen_base_weight(self.weight, self.quant_format_wdx, self.group_size_wdx)
+        )
+        diff_output = F.linear(diff_input_q.to(dtype=weight_wdx.dtype), weight_wdx, None)
         
         if svd_diff is not None:
             diff_output = diff_output + svd_diff
@@ -412,7 +465,11 @@ class QdiffSVDLinear(nn.Linear):
             self.inference_count,
             output,
             diff_output,
-            extra={"quant_format": self.quant_format, "group_size": self.group_size},
+            extra={
+                "quant_format": self.quant_format,
+                "quant_format_wdx": self.quant_format_wdx,
+                "group_size": self.group_size,
+            },
         )
         return output, diff_output
 
@@ -512,7 +569,8 @@ def QuantizeLlamaForLOZOSVD(
     model,
     uv_provider=None,
     z_provider=None,
-    quant_format="nvfp4",
+    quant_format="nvfp8",
+    quant_format_wdx=None,
     group_size=0,
 ):
     quant_backend = quant_backend_from_format(quant_format)
@@ -532,6 +590,7 @@ def QuantizeLlamaForLOZOSVD(
         if cls is QdiffSVDLinear:
             kwargs.update(
                 quant_format=quant_format,
+                quant_format_wdx=quant_format_wdx,
                 group_size=group_size,
             )
         new_linear = cls(**kwargs)
@@ -606,5 +665,6 @@ def QuantizeLlamaForLOZOSVD(
 
 def QuantizeOPTForLOZOSVD(*args, **kwargs):
     raise NotImplementedError("SVD-aware LOZO replacement is currently implemented for Llama only.")
+
 
 
