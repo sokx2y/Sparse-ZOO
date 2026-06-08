@@ -1080,6 +1080,68 @@ class LlamaModel(LlamaPreTrainedModel):
 class KwargsForCausalLM(FlashAttentionKwargs, LossKwargs): ...
 
 
+def _lozo_loss_debug_enabled(model):
+    if not getattr(model, "_lozo_debug_loss", False):
+        return False
+    step = int(getattr(model, "_lozo_debug_step", -1))
+    max_steps = int(getattr(model, "_lozo_debug_loss_steps", 5))
+    return 0 <= step < max_steps
+
+
+def _lozo_debug_float(tensor, reducer=None):
+    with torch.no_grad():
+        value = reducer(tensor.float()) if reducer is not None else tensor
+        return float(value.detach().cpu())
+
+
+def _lozo_debug_classification_loss(
+    model,
+    loss,
+    logits_cls,
+    labels_cls,
+    mask_counts,
+    num_options,
+    tag,
+):
+    if not _lozo_loss_debug_enabled(model):
+        return
+    with torch.no_grad():
+        logits_f = logits_cls.detach().float()
+        labels_cpu = labels_cls.detach().cpu().tolist()
+        nopt = logits_f.shape[-1]
+        top_vals, top_ids = logits_f.topk(k=min(2, nopt), dim=-1)
+        if nopt >= 2:
+            margin = top_vals[:, 0] - top_vals[:, 1]
+            margin_mean = float(margin.mean().detach().cpu())
+            margin_min = float(margin.min().detach().cpu())
+        else:
+            margin_mean = float("nan")
+            margin_min = float("nan")
+        correct_vals = logits_f.gather(-1, labels_cls.view(-1, 1)).squeeze(-1)
+        mask_counts_cpu = mask_counts.detach().cpu()
+        zero_masks = int((mask_counts_cpu == 0).sum().item())
+        first_rows = logits_f[:3].detach().cpu().tolist()
+        print(
+            "[LOSS-INTERNAL-DEBUG]",
+            f"step={int(getattr(model, '_lozo_debug_step', -1))}",
+            f"tag={tag}",
+            f"loss={float(loss.detach().cpu()):.12e}",
+            f"num_options={num_options}",
+            f"labels_first={labels_cpu[:8]}",
+            f"mask_zero={zero_masks}",
+            f"mask_min={int(mask_counts_cpu.min().item())}",
+            f"mask_max={int(mask_counts_cpu.max().item())}",
+            f"logits_min={float(logits_f.min().detach().cpu()):.6e}",
+            f"logits_max={float(logits_f.max().detach().cpu()):.6e}",
+            f"correct_mean={float(correct_vals.mean().detach().cpu()):.6e}",
+            f"top_ids_first={top_ids[:3].detach().cpu().tolist()}",
+            f"margin_mean={margin_mean:.6e}",
+            f"margin_min={margin_min:.6e}",
+            f"logits_first={first_rows}",
+            flush=True,
+        )
+
+
 def _llama_loss_like_wrapper(self, shift_logits, input_ids, labels, option_len=None, num_options=None):
     label_source = input_ids if input_ids is not None else labels
     shift_labels = torch.clone(label_source)[..., 1:].contiguous()
@@ -1097,6 +1159,7 @@ def _llama_loss_like_wrapper(self, shift_logits, input_ids, labels, option_len=N
     if num_options is not None:
         log_probs = F.log_softmax(shift_logits, dim=-1)
         mask = shift_labels != -100
+        mask_counts = mask.sum(-1)
 
         shift_labels_safe = shift_labels.clone()
         shift_labels_safe[~mask] = 0
@@ -1105,7 +1168,7 @@ def _llama_loss_like_wrapper(self, shift_logits, input_ids, labels, option_len=N
             log_probs, dim=-1, index=shift_labels_safe.unsqueeze(-1)
         ).squeeze(-1)
 
-        selected_log_probs = (selected_log_probs * mask).sum(-1) / mask.sum(-1)
+        selected_log_probs = (selected_log_probs * mask).sum(-1) / mask_counts
 
         if any([x != num_options[0] for x in num_options]):
             loss = 0
@@ -1118,12 +1181,32 @@ def _llama_loss_like_wrapper(self, shift_logits, input_ids, labels, option_len=N
                 loss = loss_fct(_logits, _labels) + loss
                 count += 1
                 start_id = end_id
-            return loss / count
+            loss = loss / count
+            _lozo_debug_classification_loss(
+                self,
+                loss,
+                selected_log_probs.view(1, -1),
+                labels[:1],
+                mask_counts,
+                num_options,
+                tag="variable_options",
+            )
+            return loss
         else:
             nopt = num_options[0]
             logits_cls = selected_log_probs.view(-1, nopt)
             labels_cls = labels.view(-1, nopt)[:, 0]
-            return loss_fct(logits_cls, labels_cls)
+            loss = loss_fct(logits_cls, labels_cls)
+            _lozo_debug_classification_loss(
+                self,
+                loss,
+                logits_cls,
+                labels_cls,
+                mask_counts,
+                num_options,
+                tag="fixed_options",
+            )
+            return loss
 
     return loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 

@@ -41,6 +41,8 @@ class diffLinear(nn.Linear):
         self.inference_count += 1
         # if self.inference_count == 2:
         #     print(f"input:{input.shape}; layername:{self.layer_name}")
+        input = input.to(dtype=self.weight.dtype)
+        diff_input = diff_input.to(dtype=self.weight.dtype)
         output = F.linear(input, self.weight, self.bias)
         diff_output = F.linear(diff_input, self.weight, None)
         if self.uv_provider is not None:
@@ -151,7 +153,7 @@ class QdiffLinear(nn.Linear):
         self.mx_specs0 = finalize_mx_specs(mx_specs0)
         # specs1: linear(diff_x, weight_even)
         mx_specs1 = {
-            'w_elem_format': self.mx_w_elem_format,
+            'w_elem_format': "fp4_e2m1",
             'a_elem_format': self.mx_diffa_elem_format,
             'scale_bits': 8,
             'block_size': 16,
@@ -814,46 +816,46 @@ def QuantizeLlamaForLOZO(
                 continue
 
             if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, (diffLinear, QdiffLinear)):
-                new_linear = diffLinear(
-                    layer_name=full_name,
-                    in_features=child.in_features,
-                    out_features=child.out_features,
-                    bias=(child.bias is not None),
-                    device="meta",
-                    dtype=child.weight.dtype,
-                    uv_provider=uv_provider,
-                    z_provider=z_provider,
-                )
-                new_linear.weight = child.weight
-                if child.bias is not None:
-                    new_linear.bias = child.bias
-                setattr(module, name, new_linear)
-                print(f"Replace decoder linear {full_name} with diffLinear")
-                continue
-                # new_qlinear = QdiffLinear(
-                #     enable_x=enable_x,
-                #     enable_diffx=enable_diffx,
-                #     enable_w=enable_w,
-                #     enable_diffw=enable_diffw,
+                # new_linear = diffLinear(
                 #     layer_name=full_name,
                 #     in_features=child.in_features,
                 #     out_features=child.out_features,
                 #     bias=(child.bias is not None),
                 #     device="meta",
                 #     dtype=child.weight.dtype,
-                #     mx_w_elem_format=mx_w_elem_format,
-                #     mx_a_elem_format=mx_a_elem_format,
-                #     mx_diffw_elem_format=mx_diffw_elem_format,
-                #     mx_diffa_elem_format=mx_diffa_elem_format,
                 #     uv_provider=uv_provider,
                 #     z_provider=z_provider,
                 # )
-                # new_qlinear.weight = child.weight
+                # new_linear.weight = child.weight
                 # if child.bias is not None:
-                #     new_qlinear.bias = child.bias
-                # setattr(module, name, new_qlinear)
-                # print(f"Replace decoder linear {full_name} with QdiffLinear")
+                #     new_linear.bias = child.bias
+                # setattr(module, name, new_linear)
+                # print(f"Replace decoder linear {full_name} with diffLinear")
                 # continue
+                new_qlinear = QdiffLinear(
+                    enable_x=enable_x,
+                    enable_diffx=enable_diffx,
+                    enable_w=enable_w,
+                    enable_diffw=enable_diffw,
+                    layer_name=full_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    mx_w_elem_format=mx_w_elem_format,
+                    mx_a_elem_format=mx_a_elem_format,
+                    mx_diffw_elem_format=mx_diffw_elem_format,
+                    mx_diffa_elem_format=mx_diffa_elem_format,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_qlinear.weight = child.weight
+                if child.bias is not None:
+                    new_qlinear.bias = child.bias
+                setattr(module, name, new_qlinear)
+                print(f"Replace decoder linear {full_name} with QdiffLinear")
+                continue
 
             # lm_head Linear:
             # Always use diffLinear for now.

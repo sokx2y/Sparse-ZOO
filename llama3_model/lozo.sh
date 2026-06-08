@@ -21,7 +21,7 @@ source ~/.bashrc
 # conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/lozo_llama3
 
-export CUDA_VISIBLE_DEVICES=7
+export CUDA_VISIBLE_DEVICES=5
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
@@ -48,8 +48,8 @@ elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
 
-LR=5e-7
-TASK=SST2
+LR=2e-7
+TASK=WSC
 SEED=0
 RANK=2
 STEP_INTERVAL=100
@@ -67,11 +67,12 @@ Tainer=LOZO
 svd_lora_compensation=true
 svd_lora_act_scales_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/fp16_llama3_actscales/act_scales.pt
 svd_lora_smooth_alpha=0.5
-svd_lora_checkpoint_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/llama3_calib_residual_nvfp8_nvfp8_float16_svd_rank8_1.0
+svd_lora_checkpoint_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/llama3_residual_float16_svd_rank8_1.0
 svd_lora_rank=8
-svd_lora_quant_format="nvfp8"  # quantize base_weight
+svd_lora_quant_format="nvfp4"  # quantize base_weight
 quant_format_wdx=${quant_format_wdx:-"nvfp4"}
-COMPENSATION_MODE="${COMPENSATION_MODE:-calib_residual}"
+appro_SVD=${appro_SVD:-false}
+COMPENSATION_MODE="${COMPENSATION_MODE:-residual}"
 
 # forward_delta 
 APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-true}
@@ -109,23 +110,10 @@ case $TASK in
         ;;
 esac
 
-TAG=$Tainer-$MODEL_NAME-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK-$TASK-$COMPENSATION_MODE-$svd_lora_rank-fp16
+TAG=$Tainer-$MODEL_NAME-$MODE-$STEPS-$BS-$LR-$EPS-$SEED-$STEP_INTERVAL-$RANK-$TASK-$COMPENSATION_MODE-$svd_lora_rank-fp8
 
 if [ "$APPLY_FORWARD_DELTA" = "true" ]; then
-    ENABLE="Quantdiff-${TRAINABLE_MODE}"
-
-    if [ "$ENABLE_X" = "true" ]; then
-        ENABLE="${ENABLE}-x${MX_A_ELEM_FORMAT}"
-    fi
-    if [ "$ENABLE_DIFFX" = "true" ]; then
-        ENABLE="${ENABLE}-dx${MX_DIFFA_ELEM_FORMAT}"
-    fi
-    if [ "$ENABLE_W" = "true" ]; then
-        ENABLE="${ENABLE}-w${MX_W_ELEM_FORMAT}"
-    fi
-    if [ "$ENABLE_DIFFW" = "true" ]; then
-        ENABLE="${ENABLE}-dw${MX_DIFFW_ELEM_FORMAT}"
-    fi
+    ENABLE="SVDQuantdiff-${TRAINABLE_MODE}-${svd_lora_quant_format}-${quant_format_wdx}"
 else
     ENABLE="normal-${TRAINABLE_MODE}"
 fi
@@ -173,6 +161,7 @@ python run_lozo.py \
     --svd_lora_compensation $svd_lora_compensation --svd_lora_act_scales_path $svd_lora_act_scales_path --svd_lora_smooth_alpha $svd_lora_smooth_alpha \
     --svd_lora_checkpoint_path $svd_lora_checkpoint_path --svd_lora_rank $svd_lora_rank --svd_lora_quant_format $svd_lora_quant_format \
     --quant_format_wdx $quant_format_wdx \
+    --appro_SVD $appro_SVD \
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@" 

@@ -77,6 +77,14 @@ class OurArguments(TrainingArguments):
         default=False,
         metadata={"help": "Run device preflight and exit without training."}
     )
+    debug_loss: bool = field(
+        default=False,
+        metadata={"help": "Print high-precision LOZO and classification-loss diagnostics for early steps."}
+    )
+    debug_loss_steps: int = field(
+        default=5,
+        metadata={"help": "Number of early LOZO steps to print when debug_loss is enabled."}
+    )
     
     # LOZO
     zo_eps: float = 1e-3 # eps in LOZO
@@ -269,6 +277,16 @@ class OurArguments(TrainingArguments):
     svd_lora_adapter_name: str = field(
         default="default",
         metadata={"help": "Adapter name used in PEFT-style SVD-LoRA checkpoint keys."}
+    )
+    appro_SVD: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Use approximate SVD forward_delta diff: "
+                "x_dv_u + x_v_du + dx_v_u + dx_v_du. "
+                "Default keeps the original exact SVD path."
+            )
+        }
     )
     
 
@@ -993,8 +1011,17 @@ class Framework:
                     compensation_mode=svd_mode,
                     lora_scaling=lora_scaling,
                 )
+                if self.args.appro_SVD:
+                    logger.info("[SVD-LoRA] enabling approximate SVD forward_delta")
+                    for module in self.model.modules():
+                        if hasattr(module, "svd_lora_u") and hasattr(module, "svd_lora_v"):
+                            module.appro_SVD = True
         
             logger.info("Replace All nnLayers with diffLayers to support forward_delta")
+            if self.args.debug_loss:
+                for module in self.model.modules():
+                    if hasattr(module, "debug_nonfinite"):
+                        module.debug_nonfinite = True
             if self.args.profile_linear and self.args.local_rank <= 0:
                 self._attach_linear_outlier_profiler()
             if self.args.profile_perturb_distribution and self.args.local_rank <= 0:

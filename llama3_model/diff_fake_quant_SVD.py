@@ -71,12 +71,28 @@ def lowrank_direction_from_provider(provider, param_name, param, inference_count
     return left.matmul(right.t()), scale
 
 
-def quantize_svd_lora_factor_nvfp8(tensor: Optional[torch.Tensor]):
+def quantize_svd_lora_factor_nvfp8(tensor: Optional[torch.Tensor], return_raw: bool = False):
     if tensor is None:
-        return None
+        return (None, None) if return_raw else None
     if quantize_weight_nvfp8 is None:
         raise RuntimeError("SVD-LoRA factor FP8 quantization requires smoothquant.fake_quant to be importable")
-    return quantize_weight_nvfp8(tensor, group_size=None)
+    quantized = quantize_weight_nvfp8(tensor, group_size=None)
+    return (quantized, quantized) if return_raw else quantized
+
+
+def _finite_stats(name, value):
+    if value is None:
+        return f"{name}=None"
+    value_f = value.detach().float()
+    finite = torch.isfinite(value_f)
+    if finite.any():
+        finite_vals = value_f[finite]
+        return (
+            f"{name}:finite={bool(finite.all().item())}"
+            f",min={float(finite_vals.min().cpu()):.6e}"
+            f",max={float(finite_vals.max().cpu()):.6e}"
+        )
+    return f"{name}:finite=False,all_nonfinite=True"
 
 
 def default_group_size_for_format(quant_format: Optional[str]):
@@ -287,10 +303,34 @@ def svd_lora_forward_delta(module, input, diff_input):
     )
     if getattr(module, "quantize_svd_lora_factors_fp8", False):
         # QdiffSVDLinear locally FP8-quantizes U/V/dU/dV before SVD-LoRA forward-delta math.
-        u = quantize_svd_lora_factor_nvfp8(u)
-        v = quantize_svd_lora_factor_nvfp8(v)
-        du = quantize_svd_lora_factor_nvfp8(du)
-        dv = quantize_svd_lora_factor_nvfp8(dv)
+        if getattr(module, "debug_nonfinite", False):
+            u, u_q = quantize_svd_lora_factor_nvfp8(u, return_raw=True)
+            v, v_q = quantize_svd_lora_factor_nvfp8(v, return_raw=True)
+            du, du_q = quantize_svd_lora_factor_nvfp8(du, return_raw=True)
+            dv, dv_q = quantize_svd_lora_factor_nvfp8(dv, return_raw=True)
+            quantized_factors = (u_q, v_q, du_q, dv_q)
+            if (
+                any(t is not None and not torch.isfinite(t).all() for t in quantized_factors)
+                and not getattr(module.__class__, "_printed_factor_nonfinite_debug", False)
+            ):
+                module.__class__._printed_factor_nonfinite_debug = True
+                print(
+                    "[QDIFF-SVD-FACTOR-NONFINITE]",
+                    f"layer={module.layer_name}",
+                    f"inference_count={module.inference_count}",
+                    _finite_stats("u", getattr(module, "svd_lora_u", None)),
+                    _finite_stats("v", getattr(module, "svd_lora_v", None)),
+                    _finite_stats("u_q", u_q),
+                    _finite_stats("v_q", v_q),
+                    _finite_stats("du_q", du_q),
+                    _finite_stats("dv_q", dv_q),
+                    flush=True,
+                )
+        else:
+            u = quantize_svd_lora_factor_nvfp8(u)
+            v = quantize_svd_lora_factor_nvfp8(v)
+            du = quantize_svd_lora_factor_nvfp8(du)
+            dv = quantize_svd_lora_factor_nvfp8(dv)
 
     plus = svd_lora_output(input, u, v)
     if plus is None:
@@ -323,15 +363,28 @@ def svd_lora_forward_delta(module, input, diff_input):
 
     delta_u = torch.zeros_like(u) if du is None else u_scale * du
     delta_v = torch.zeros_like(v) if dv is None else v_scale * dv
+    use_appro_svd = getattr(module, "appro_SVD", False)
+    profile_svd_terms = svd_term_profile_enabled(module.inference_count)
+
+    if use_appro_svd and not profile_svd_terms:
+        svd_diff = (
+            svd_lora_output(input, u, delta_v)
+            + svd_lora_output(input, delta_u, v)
+            + svd_lora_output(diff_input, u, v)
+            + svd_lora_output(diff_input, delta_u, v)
+        )
+        return plus, svd_diff
+
     u_minus = u + delta_u
     v_minus = v + delta_v
     minus = svd_lora_output(input, u_minus, v_minus)
     diff_minus = svd_lora_output(diff_input, u_minus, v_minus)
     if diff_minus is not None:
         minus = minus + diff_minus
-    svd_diff = minus - plus
+    full_svd_diff = minus - plus
+    svd_diff = full_svd_diff
 
-    if svd_term_profile_enabled(module.inference_count):
+    if profile_svd_terms:
         terms = {
             "x_dv_u": svd_lora_output(input, u, delta_v),
             "x_v_du": svd_lora_output(input, delta_u, v),
@@ -343,16 +396,19 @@ def svd_lora_forward_delta(module, input, diff_input):
         }
         approximations = {
             "first_order": terms["x_dv_u"] + terms["x_v_du"] + terms["dx_v_u"],
+            "appro_SVD": terms["x_dv_u"] + terms["x_v_du"] + terms["dx_v_u"] + terms["dx_v_du"],
             "no_dx_factor_perturb": terms["x_dv_u"] + terms["x_v_du"] + terms["x_dv_du"] + terms["dx_v_u"],
             "only_second_order_and_dx_base": terms["x_dv_du"] + terms["dx_v_u"] + terms["dx_dv_du"],
             "sum_all_terms": sum(terms.values()),
         }
+        if getattr(module, "appro_SVD", False):
+            svd_diff = approximations["appro_SVD"]
         record_svd_terms_profile(
             module.layer_name,
             module,
             module.inference_count,
             terms,
-            svd_diff,
+            full_svd_diff,
             approximations,
         )
     return plus, svd_diff
@@ -391,6 +447,9 @@ class diffSVDLinear(diffLinear):
 
 
 class QdiffSVDLinear(nn.Linear):
+    _printed_nonfinite_debug = False
+    _printed_factor_nonfinite_debug = False
+
     def __init__(
         self,
         layer_name: str,
@@ -414,8 +473,10 @@ class QdiffSVDLinear(nn.Linear):
         self.perturb_distribution_profiler = None
         self.quant_format = (quant_format or "none").lower()
         self.quant_format_wdx = (quant_format_wdx or "none").lower()
-        # self.quantize_svd_lora_factors_fp8 = True
-        self.quantize_svd_lora_factors_fp8 = False
+        # uv -> fp8?
+        self.quantize_svd_lora_factors_fp8 = True
+        self.appro_SVD = False
+        self.debug_nonfinite = False
         # usually, we can keep group_size = 0 and use _effective_group_size to decide self.group-size automatically.
         self.group_size = _effective_group_size(self.quant_format, group_size)
         self.group_size_wdx = _effective_group_size(self.quant_format_wdx, group_size)
@@ -458,6 +519,41 @@ class QdiffSVDLinear(nn.Linear):
         
         if svd_diff is not None:
             diff_output = diff_output + svd_diff
+        if self.debug_nonfinite and not QdiffSVDLinear._printed_nonfinite_debug and (
+            not torch.isfinite(output).all() or not torch.isfinite(diff_output).all()
+        ):
+            QdiffSVDLinear._printed_nonfinite_debug = True
+            with torch.no_grad():
+                def finite_stats(name, value):
+                    if value is None:
+                        return f"{name}=None"
+                    value_f = value.detach().float()
+                    finite = torch.isfinite(value_f)
+                    if finite.any():
+                        finite_vals = value_f[finite]
+                        return (
+                            f"{name}:finite={bool(finite.all().item())}"
+                            f",min={float(finite_vals.min().cpu()):.6e}"
+                            f",max={float(finite_vals.max().cpu()):.6e}"
+                        )
+                    return f"{name}:finite=False,all_nonfinite=True"
+
+                print(
+                    "[QDIFF-SVD-NONFINITE]",
+                    f"layer={self.layer_name}",
+                    f"inference_count={self.inference_count}",
+                    finite_stats("input", input),
+                    finite_stats("diff_input", diff_input),
+                    finite_stats("input_q", input_q),
+                    finite_stats("diff_input_q", diff_input_q),
+                    finite_stats("weight", self.weight),
+                    finite_stats("weight_wdx", weight_wdx),
+                    finite_stats("svd_output", svd_output),
+                    finite_stats("svd_diff", svd_diff),
+                    finite_stats("output", output),
+                    finite_stats("diff_output", diff_output),
+                    flush=True,
+                )
         record_forward_delta_profile(
             "svd_quant",
             self.layer_name,
@@ -630,15 +726,28 @@ def QuantizeLlamaForLOZOSVD(
                 print(f"Replace decoder linear {full_name} with SVD-aware diff linear")
                 continue
 
-            if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffSVDLinear):
+            if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
                 provider_layer_name = full_name
                 try:
                     if hasattr(model, "model") and hasattr(model.model, "embed_tokens") and child.weight is model.model.embed_tokens.weight:
                         provider_layer_name = "model.embed_tokens"
                 except Exception:
                     provider_layer_name = full_name
-                setattr(module, name, make_linear(provider_layer_name, child))
-                print(f"Replace {full_name} with SVD-aware diff linear, provider layer_name={provider_layer_name}")
+                new_head = diffLinear(
+                    layer_name=provider_layer_name,
+                    in_features=child.in_features,
+                    out_features=child.out_features,
+                    bias=(child.bias is not None),
+                    device="meta",
+                    dtype=child.weight.dtype,
+                    uv_provider=uv_provider,
+                    z_provider=z_provider,
+                )
+                new_head.weight = child.weight
+                if child.bias is not None:
+                    new_head.bias = child.bias
+                setattr(module, name, new_head)
+                print(f"Replace {full_name} with diffLinear, provider layer_name={provider_layer_name}")
                 continue
 
             if child.__class__.__name__ == "LlamaRMSNorm":
@@ -665,6 +774,7 @@ def QuantizeLlamaForLOZOSVD(
 
 def QuantizeOPTForLOZOSVD(*args, **kwargs):
     raise NotImplementedError("SVD-aware LOZO replacement is currently implemented for Llama only.")
+
 
 
 

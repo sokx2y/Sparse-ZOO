@@ -1150,6 +1150,10 @@ class LowRankTrainer(Trainer):
                         raise AttributeError(
                             "model 没有 forward_delta 方法，请为 model 添加此路径"
                         )
+                    if getattr(self.args, "debug_loss", False):
+                        setattr(model, "_lozo_debug_loss", True)
+                        setattr(model, "_lozo_debug_loss_steps", int(getattr(self.args, "debug_loss_steps", 5)))
+                        setattr(model, "_lozo_debug_step", int(getattr(self, "step", -1)))
                     outputs = model.forward_delta(**inputs)
 
                     if not isinstance(outputs, (tuple, list)) or len(outputs) < 2:
@@ -1345,6 +1349,29 @@ class LowRankTrainer(Trainer):
         # loss2 = self.zo_forward(model, inputs)
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        if getattr(args, "debug_loss", False) and self.step < int(getattr(args, "debug_loss_steps", 5)):
+            loss1_f = float(loss1.detach().cpu())
+            loss2_f = float(loss2.detach().cpu())
+            print(
+                "[ZO-LOSS-DEBUG]",
+                f"step={self.step}",
+                f"loss1={loss1_f:.12e}",
+                f"loss2={loss2_f:.12e}",
+                f"diff={(loss1_f - loss2_f):.12e}",
+                f"eps={self.args.zo_eps:.6e}",
+                f"projected_grad={self.projected_grad:.12e}",
+                flush=True,
+            )
+        if not np.isfinite(self.projected_grad):
+            print(
+                "[ZO-NONFINITE-GRAD]",
+                f"step={self.step}",
+                f"loss1={float(loss1.detach().cpu()):.12e}",
+                f"loss2={float(loss2.detach().cpu()):.12e}",
+                "projected_grad is non-finite; skip this ZO update by setting projected_grad=0.",
+                flush=True,
+            )
+            self.projected_grad = 0.0
 
         # No gradient accumulation support
         assert self.args.gradient_accumulation_steps == 1
@@ -1409,11 +1436,15 @@ class LowRankTrainer(Trainer):
     
             denom = max(1, self.state.global_step - self._globalstep_last_logged)
             logs["loss"] = round(tr_loss_scalar / denom, 4)
+            if getattr(self.args, "debug_loss", False):
+                logs["loss_raw"] = tr_loss_scalar / denom
             logs["learning_rate"] = self._get_learning_rate()
     
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
+            if self.is_world_process_zero():
+                logger.info(logs)
             self.log(logs)
     
         metrics = None
@@ -1502,3 +1533,4 @@ class LowRankTrainer(Trainer):
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save")
+
