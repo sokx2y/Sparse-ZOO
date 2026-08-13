@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 import copy
 from metrics import f1
+from nv_quant_linear import NVQuantLinear
 import numpy as np
 
 from tqdm.auto import tqdm
@@ -718,6 +719,10 @@ class LowRankTrainer(Trainer):
                 z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
                 param.data = param.data + scaling_factor * z * self.args.zo_eps
 
+            nv_module = self.nv_quantized_weight_modules.get(id(param))
+            if nv_module is not None:
+                nv_module.requantize_weight_()
+
     def zo_forward(self, model, inputs):
         """
         Get (no gradient) loss from the model. Dropout is turned off too.
@@ -775,6 +780,11 @@ class LowRankTrainer(Trainer):
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
+        self.nv_quantized_weight_modules = {
+            id(module.weight): module
+            for module in model.modules()
+            if isinstance(module, NVQuantLinear)
+        }
 
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
@@ -819,6 +829,10 @@ class LowRankTrainer(Trainer):
                     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z + args.weight_decay * param.data)
                 else:
                     param.data = param.data - self._get_learning_rate() * (self.projected_grad * z)
+
+            nv_module = self.nv_quantized_weight_modules.get(id(param))
+            if nv_module is not None:
+                nv_module.requantize_weight_()
 
         self.lr_scheduler.step()
         

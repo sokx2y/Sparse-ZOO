@@ -10,20 +10,20 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 source ~/.bashrc
 conda activate /capsule/home/xiangyuxing/oldmkpk/conda_envs/torch210cu118
 
-export CUDA_VISIBLE_DEVICES=5
+export CUDA_VISIBLE_DEVICES=4
 export WANDB_DISABLED=true
 export TQDM_DISABLE=1
 
 FEW_SHOT_TYPE=${FEW_SHOT_TYPE:-"prompt"}
 
-TASK=${TASK:-RTE}
+TASK=${TASK:-SST-2}
 K=${K:-512}
 SEED=${SEED:-42}
 BS=${BS:-64}
-LR=${LR:-2e-7}
+LR=${LR:-5e-7}
 EPS=${EPS:-1e-3}
 WD=${WD:-0}
-STEP=${STEP:-100000}
+STEP=${STEP:-20000}
 EVAL_STEP=${EVAL_STEP:-1000}
 STEP_INTERVAL=${STEP_INTERVAL:-50}
 RANK=${RANK:-8}
@@ -33,7 +33,7 @@ MODEL=${MODEL:-"/lamport/shared/hzheng/workspace/model/roberta-large"}
 # MODEL=${MODEL:-"/lamport/shared/hzheng/workspace/model/opt-350m"}
 MODELNAME=${MODELNAME:-"roberta-large"}
 # MODELNAME=${MODELNAME:-"opt"}
-LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"test_mx_new/mx168"}
+LOG_DIR_PREFIX=${LOG_DIR_PREFIX:-"LogPaperSVD"}
 
 
 # lora参数
@@ -60,6 +60,16 @@ WEIGHT_BIT=${WEIGHT_BIT:-4}
 
 
 # ----------------- Here! ------------------
+# svd
+svd_lora_compensation=true
+svd_lora_act_scales_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/roberta-large/fp16_roberta_actscales/act_scales.pt
+svd_lora_smooth_alpha=0.5
+svd_lora_checkpoint_path=/capsule/home/xiangyuxing/Sparse-ZOO/SVD-ZOO-Quant/outputs/roberta-large/roberta_residual_nvfp4_nvfp8_float16_svd_rank32_1.0
+svd_lora_rank=32
+svd_lora_quant_format="nvfp4"  # quantize base_weight
+quant_format_wdx=${quant_format_wdx:-"nvfp4"}
+appro_SVD=${appro_SVD:-false}
+COMPENSATION_MODE="${COMPENSATION_MODE:-residual}"
 # forward_delta 
 APPLY_FORWARD_DELTA=${APPLY_FORWARD_DELTA:-true}
 ENABLE_X=${ENABLE_X:-true}
@@ -94,31 +104,18 @@ echo "apply_forward_delta": "$APPLY_FORWARD_DELTA"
 
 GR_TAG=seed$SEED-bs$BS-lr$LR-eps$EPS-wd$WD-step$STEP-evalstep$EVAL_STEP-step-interval$STEP_INTERVAL-rank$RANK
 EXTRA_TAG=${EXTRA_TAG:-ft}
-TAG=${TAG:-k${K}-${MODELNAME}-lowrank-${EXTRA_TAG}-${LOZO_OPTIMIZER}-beta1-${BETA1}}
+TAG=$MODELNAME-$COMPENSATION_MODE-$svd_lora_rank-fp8
 
-echo "Grid search tag: $GR_TAG"
-echo "Tag: $TAG"
-
-# 设置 ENABLE 变量 用于表征区分 quantize pattern
 if [ "$APPLY_FORWARD_DELTA" = "true" ]; then
-    ENABLE="Quantdiff-${TRAINABLE_MODE}"
-
-    if [ "$ENABLE_X" = "true" ]; then
-        ENABLE="${ENABLE}-x${MX_A_ELEM_FORMAT}"
-    fi
-    if [ "$ENABLE_DIFFX" = "true" ]; then
-        ENABLE="${ENABLE}-dx${MX_DIFFA_ELEM_FORMAT}"
-    fi
-    if [ "$ENABLE_W" = "true" ]; then
-        ENABLE="${ENABLE}-w${MX_W_ELEM_FORMAT}"
-    fi
-    if [ "$ENABLE_DIFFW" = "true" ]; then
-        ENABLE="${ENABLE}-dw${MX_DIFFW_ELEM_FORMAT}"
-    fi
+    ENABLE="SVDQuantdiff-${TRAINABLE_MODE}-${svd_lora_quant_format}-${quant_format_wdx}"
 else
     ENABLE="normal-${TRAINABLE_MODE}"
 fi
 
+ENABLE="${ENABLE}"
+
+echo "Grid search tag: $GR_TAG"
+echo "Tag: $TAG"
 echo "Quantize pattern: $ENABLE"
 
 EVALUATE_DURING_TRAINING=${EVALUATE_DURING_TRAINING:-true}
@@ -142,6 +139,10 @@ TYPE=$FEW_SHOT_TYPE GRID_TAG=$GR_TAG TAG=$TAG STEPS=$STEP TASK=$TASK SEED=$SEED 
     --apply_forward_delta $APPLY_FORWARD_DELTA --use_forward_delta_loss $APPLY_FORWARD_DELTA\
     --load_best_model_at_end True --evaluation_strategy steps --save_strategy steps --save_total_limit 1 --evaluate_during_training $EVALUATE_DURING_TRAINING\
     --save_steps $EVAL_STEP \
+    --svd_lora_compensation $svd_lora_compensation --svd_lora_act_scales_path $svd_lora_act_scales_path --svd_lora_smooth_alpha $svd_lora_smooth_alpha \
+    --svd_lora_checkpoint_path $svd_lora_checkpoint_path --svd_lora_rank $svd_lora_rank --svd_lora_quant_format $svd_lora_quant_format \
+    --quant_format_wdx $quant_format_wdx \
+    --appro_SVD $appro_SVD \
     --debug_forward_delta --debug_forward_delta_steps 10 --debug_forward_delta_tol 1e-6 --debug_forward_delta_abort False \
     --compare_seed --compare_seed_steps 30 \
     $@

@@ -228,6 +228,15 @@ class LowRankTrainer(Trainer):
 
     from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
 
+    def log(self, logs: Dict[str, float], *args, **kwargs):
+        result = super().log(logs, *args, **kwargs)  # PORTED: keep the existing Trainer logging/save/eval behavior unchanged.
+        if self.is_world_process_zero():  # PORTED: mirror Trainer logs into logger.info for redirected run logs.
+            display_logs = dict(logs)  # PORTED: avoid mutating callback/reporting payloads.
+            if self.state.epoch is not None and "epoch" not in display_logs:  # PORTED: preserve the familiar {'loss', 'learning_rate', 'epoch'} shape.
+                display_logs["epoch"] = round(self.state.epoch, 2)
+            logger.info(display_logs)  # PORTED: make loss visible in the script log file.
+        return result
+
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
     ):
@@ -925,6 +934,12 @@ class LowRankTrainer(Trainer):
         """
         def provider(param_name, shape, device, dtype, inference_count):
             if not hasattr(self, "z") or param_name not in self.z:
+                if (  # PORTED: multi-GPU/tied-weight forward_delta may ask for frozen params; return zero delta.
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return torch.zeros(shape, device=device, dtype=dtype), 0.0
                 keys = list(self.z.keys())[:20] if hasattr(self, "z") else []
                 raise RuntimeError(
                     f"[FD_PROVIDER_MISS][z] param_name={param_name}, "
@@ -944,6 +959,16 @@ class LowRankTrainer(Trainer):
         """
         def provider(param_name, shape, device, dtype, inference_count):
             if not hasattr(self, "u") or param_name not in self.u:
+                if (  # PORTED: keep forward_delta valid for non-trainable OPT params under device_map/tied weights.
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return (
+                        torch.zeros(shape[0], 1, device=device, dtype=dtype),
+                        torch.zeros(shape[1], 1, device=device, dtype=dtype),
+                        0.0,
+                    )
                 keys = list(self.u.keys())[:20] if hasattr(self, "u") else []
                 raise RuntimeError(
                     f"[FD_PROVIDER_MISS][u] param_name={param_name}, "
@@ -952,6 +977,16 @@ class LowRankTrainer(Trainer):
                 )
     
             if not hasattr(self, "v") or param_name not in self.v:
+                if (  # PORTED: keep forward_delta valid for non-trainable OPT params under device_map/tied weights.
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return (
+                        torch.zeros(shape[0], 1, device=device, dtype=dtype),
+                        torch.zeros(shape[1], 1, device=device, dtype=dtype),
+                        0.0,
+                    )
                 keys = list(self.v.keys())[:20] if hasattr(self, "v") else []
                 raise RuntimeError(
                     f"[FD_PROVIDER_MISS][v] param_name={param_name}, "
@@ -1052,9 +1087,13 @@ class LowRankTrainer(Trainer):
             self.v = {}
 
         self.named_parameters_to_optim = []
+        self.all_parameter_names = set()  # PORTED: provider miss handling needs to distinguish frozen from missing params.
+        self.trainable_parameter_names = set()  # PORTED: provider miss handling needs trainable membership.
         for name, param in model.named_parameters():
+            self.all_parameter_names.add(name)  # PORTED: record every OPT parameter visible after wrapping/device mapping.
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
+                self.trainable_parameter_names.add(name)  # PORTED: record parameters that should have sampled u/v/z.
 
         # Sample the random seed for sampling 
         self.zo_random_seed = np.random.randint(1000000000)
@@ -1167,6 +1206,82 @@ class LowRankTrainer(Trainer):
         # loss2 = self.zo_forward(model, inputs)
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        if getattr(args, "debug_loss", False):
+            loss1_f = float(loss1.detach().cpu())
+            loss2_f = float(loss2.detach().cpu())
+            loss_diff_f = loss1_f - loss2_f
+            projected_grad_f = float(self.projected_grad)
+            if self.step < int(getattr(args, "debug_loss_steps", 5)):
+                print(
+                    "[ZO-LOSS-DEBUG]",
+                    f"step={self.step}",
+                    f"loss1={loss1_f:.12e}",
+                    f"loss2={loss2_f:.12e}",
+                    f"diff={loss_diff_f:.12e}",
+                    f"eps={self.args.zo_eps:.6e}",
+                    f"projected_grad={projected_grad_f:.12e}",
+                    flush=True,
+                )
+            interval = int(getattr(args, "debug_loss_interval", 0) or 0)
+            if interval > 0:
+                stats = getattr(self, "_zo_loss_debug_stats", None)
+                if stats is None:
+                    stats = {
+                        "start_step": self.step,
+                        "n": 0,
+                        "finite_n": 0,
+                        "nonfinite_n": 0,
+                        "sum_abs_diff": 0.0,
+                        "max_abs_diff": 0.0,
+                        "sum_abs_pg": 0.0,
+                        "max_abs_pg": 0.0,
+                        "sign_flips": 0,
+                        "last_sign": 0,
+                    }
+                    self._zo_loss_debug_stats = stats
+                abs_diff = abs(loss_diff_f)
+                stats["n"] += 1
+                stats["sum_abs_diff"] += abs_diff
+                stats["max_abs_diff"] = max(stats["max_abs_diff"], abs_diff)
+                if np.isfinite(projected_grad_f):
+                    abs_pg = abs(projected_grad_f)
+                    sign = 1 if projected_grad_f > 0 else (-1 if projected_grad_f < 0 else 0)
+                    stats["finite_n"] += 1
+                    stats["sum_abs_pg"] += abs_pg
+                    stats["max_abs_pg"] = max(stats["max_abs_pg"], abs_pg)
+                    if stats["last_sign"] and sign and sign != stats["last_sign"]:
+                        stats["sign_flips"] += 1
+                    if sign:
+                        stats["last_sign"] = sign
+                else:
+                    stats["nonfinite_n"] += 1
+                if (self.step + 1) % interval == 0:
+                    n = max(int(stats["n"]), 1)
+                    finite_n = max(int(stats["finite_n"]), 1)
+                    flip_den = max(int(stats["finite_n"]) - 1, 1)
+                    print(
+                        "[ZO-LOSS-STATS]",
+                        f"steps={stats['start_step']}-{self.step}",
+                        f"n={stats['n']}",
+                        f"abs_diff_mean={stats['sum_abs_diff'] / n:.12e}",
+                        f"abs_diff_max={stats['max_abs_diff']:.12e}",
+                        f"pg_abs_mean={stats['sum_abs_pg'] / finite_n:.12e}",
+                        f"pg_abs_max={stats['max_abs_pg']:.12e}",
+                        f"pg_sign_flip_ratio={stats['sign_flips'] / flip_den:.6f}",
+                        f"nonfinite={stats['nonfinite_n']}",
+                        flush=True,
+                    )
+                    self._zo_loss_debug_stats = None
+        if not np.isfinite(self.projected_grad):
+            print(
+                "[ZO-NONFINITE-GRAD]",
+                f"step={self.step}",
+                f"loss1={float(loss1.detach().cpu()):.12e}",
+                f"loss2={float(loss2.detach().cpu()):.12e}",
+                "projected_grad is non-finite; skip this ZO update by setting projected_grad=0.",
+                flush=True,
+            )
+            self.projected_grad = 0.0
 
         # No gradient accumulation support
         assert self.args.gradient_accumulation_steps == 1
@@ -1291,3 +1406,4 @@ class LowRankTrainer(Trainer):
         # Push to the Hub when `save_model` is called by the user.
         if self.args.push_to_hub and not _internal_call:
             self.push_to_hub(commit_message="Model save")
+

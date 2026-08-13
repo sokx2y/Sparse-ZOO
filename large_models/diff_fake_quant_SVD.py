@@ -2,14 +2,16 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 
+# PORTED: SVD-LoRA forward_delta support adapted from llama3_model for OPT modules.
 import torch
 from torch import nn
 import torch.nn.functional as F
 
 from diff_fake_quant_mx import (
+    QdiffLinear,  # PORTED: keep SVD-aware OPT decoder linears compatible with QuantizeOPTForLOZO isinstance checks.
     diffEmbedding,
+    diffLayerNorm,  # PORTED: OPT uses LayerNorm.
     diffLinear,
-    diffLlamaRMSNorm,
 )
 from forward_delta_debug import (
     record_forward_delta_profile,
@@ -412,10 +414,10 @@ def svd_lora_forward_delta(module, input, diff_input):
 
     delta_u = torch.zeros_like(u) if du is None else u_scale * du
     delta_v = torch.zeros_like(v) if dv is None else v_scale * dv
-    use_appro_svd = getattr(module, "appro_SVD", False)
-    profile_svd_terms = svd_term_profile_enabled(module.inference_count)
+    use_appro_svd = getattr(module, "appro_SVD", False)  # PORTED: allow llama3-style approximate SVD forward_delta.
+    profile_svd_terms = svd_term_profile_enabled(module.inference_count)  # PORTED: keep exact path when profiling term errors.
 
-    if use_appro_svd and not profile_svd_terms:
+    if use_appro_svd and not profile_svd_terms:  # PORTED: fast approximate SVD delta path from llama3_model.
         svd_diff = (
             svd_lora_output(input, u, delta_v)
             + svd_lora_output(input, delta_u, v)
@@ -430,10 +432,10 @@ def svd_lora_forward_delta(module, input, diff_input):
     diff_minus = svd_lora_output(diff_input, u_minus, v_minus)
     if diff_minus is not None:
         minus = minus + diff_minus
-    full_svd_diff = minus - plus
-    svd_diff = full_svd_diff
+    full_svd_diff = minus - plus  # PORTED: preserve exact diff for profiling while allowing approximate output.
+    svd_diff = full_svd_diff  # PORTED: default remains exact unless appro_SVD is enabled.
 
-    if profile_svd_terms:
+    if profile_svd_terms:  # PORTED: reuse cached profile flag so approximation mode still records exact-vs-approx stats.
         terms = {
             "x_dv_u": svd_lora_output(input, u, delta_v),
             "x_v_du": svd_lora_output(input, delta_u, v),
@@ -445,19 +447,19 @@ def svd_lora_forward_delta(module, input, diff_input):
         }
         approximations = {
             "first_order": terms["x_dv_u"] + terms["x_v_du"] + terms["dx_v_u"],
-            "appro_SVD": terms["x_dv_u"] + terms["x_v_du"] + terms["dx_v_u"] + terms["dx_v_du"],
+            "appro_SVD": terms["x_dv_u"] + terms["x_v_du"] + terms["dx_v_u"] + terms["dx_v_du"],  # PORTED: llama3 approximate SVD formula.
             "no_dx_factor_perturb": terms["x_dv_u"] + terms["x_v_du"] + terms["x_dv_du"] + terms["dx_v_u"],
             "only_second_order_and_dx_base": terms["x_dv_du"] + terms["dx_v_u"] + terms["dx_dv_du"],
             "sum_all_terms": sum(terms.values()),
         }
-        if getattr(module, "appro_SVD", False):
+        if getattr(module, "appro_SVD", False):  # PORTED: profiling keeps logs exact but returns approximate diff when requested.
             svd_diff = approximations["appro_SVD"]
         record_svd_terms_profile(
             module.layer_name,
             module,
             module.inference_count,
             terms,
-            full_svd_diff,
+            full_svd_diff,  # PORTED: profiler compares approximations against the true SVD diff.
             approximations,
         )
     return plus, svd_diff
@@ -558,7 +560,11 @@ def q_svd_lora_forward_delta(module, input, diff_input):
 
 
 class diffSVDLinear(diffLinear):
+    def __repr__(self):
+        return (f"diffSVDLinear({self.in_features}, {self.out_features}, bias={self.bias is not None})")  # PORTED: make SVD replacement visible in print(model).
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = input.to(dtype=self.weight.dtype)  # PORTED: OPT lm_head/project layers can receive fp32 activations with fp16 weights.
         output = F.linear(input, self.weight, self.bias)
         svd_out = svd_lora_output(
             input,
@@ -569,6 +575,8 @@ class diffSVDLinear(diffLinear):
 
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor):
         self.inference_count += 1
+        input = input.to(dtype=self.weight.dtype)  # PORTED: keep non-quantized SVD Linear dtype-compatible under multi-GPU OPT.
+        diff_input = diff_input.to(dtype=self.weight.dtype)  # PORTED: keep forward_delta base diff matmul dtype-compatible.
         output = F.linear(input, self.weight, self.bias)
         svd_output, svd_diff = svd_lora_forward_delta(self, input, diff_input)
         if svd_output is not None:
@@ -589,7 +597,7 @@ class diffSVDLinear(diffLinear):
         return output, diff_output
 
 
-class QdiffSVDLinear(nn.Linear):
+class QdiffSVDLinear(QdiffLinear):  # PORTED: inherit OPT QdiffLinear so SVD replacement remains structurally compatible.
     _printed_nonfinite_debug = False
     _printed_factor_nonfinite_debug = False
 
@@ -607,18 +615,30 @@ class QdiffSVDLinear(nn.Linear):
         quant_format_wdx: Optional[str] = None,
         group_size: int = 0,
     ):
-        super().__init__(in_features, out_features, bias, device, dtype)
-        self.inference_count = 0
-        self.layer_name = layer_name
-        self.uv_provider = uv_provider
-        self.z_provider = z_provider
+        super().__init__(  # PORTED: initialize the OPT quantized diff-linear base attributes before SVD-specific overrides.
+            enable_x=False,
+            enable_diffx=False,
+            enable_w=False,
+            enable_diffw=False,
+            layer_name=layer_name,
+            in_features=in_features,
+            out_features=out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+            mx_w_elem_format=None,
+            mx_a_elem_format=None,
+            mx_diffw_elem_format=None,
+            mx_diffa_elem_format=None,
+            uv_provider=uv_provider,
+            z_provider=z_provider,
+        )
         self.outlier_profiler = None
         self.perturb_distribution_profiler = None
         self.quant_format = (quant_format or "none").lower()
         self.quant_format_wdx = (quant_format_wdx or "none").lower()
-        # uv -> fp8?
         self.quantize_svd_lora_factors_fp8 = True
-        self.appro_SVD = False
+        self.appro_SVD = False  # PORTED: default exact SVD delta, run_lozo can enable approximate mode.
         self.debug_nonfinite = False
         # usually, we can keep group_size = 0 and use _effective_group_size to decide self.group-size automatically.
         self.group_size = _effective_group_size(self.quant_format, group_size)
@@ -627,6 +647,13 @@ class QdiffSVDLinear(nn.Linear):
         self.act_quant, self.diff_act_quant = activation_quantizers_from_format(
             self.quant_format,
             self.group_size,
+        )
+
+    def __repr__(self):
+        return (  # PORTED: make SVD replacement visible while preserving QdiffLinear-compatible fields.
+            f"QdiffSVDLinear({self.in_features}, {self.out_features}, bias={self.bias is not None}, "
+            f"quant_format={self.quant_format}, quant_format_wdx={self.quant_format_wdx}, "
+            f"group_size={self.group_size}, group_size_wdx={self.group_size_wdx})"
         )
 
     def _base_linear(self, input, weight=None, bias=None, specs=None):
@@ -740,7 +767,7 @@ def attach_svd_lora_to_diff_layers(
 
     attached = 0
     missing = []
-    reconstructed_residual = 0
+    reconstructed_residual = 0  # PORTED: count compact residual checkpoints reconstructed at runtime.
     for name, module in model.named_modules():
         if not isinstance(module, (diffSVDLinear, QdiffSVDLinear)):
             continue
@@ -761,14 +788,14 @@ def attach_svd_lora_to_diff_layers(
             residual_key = f"{name}.svd_residual_weight"
             if residual_key in state_dict:
                 residual_weight = state_dict[residual_key]
-                residual_source = "loaded"
+                residual_source = "loaded"  # PORTED: keep old full residual checkpoints compatible.
             else:
                 with torch.no_grad():
                     s_actual = (lora_b.float() * float(lora_scaling)).matmul(
                         lora_a.float()
                     )
                     residual_weight = module.weight.detach().float().cpu() - s_actual
-                residual_source = "reconstructed"
+                residual_source = "reconstructed"  # PORTED: compact residual checkpoint omits W_residual and rebuilds it from W_smooth-S.
                 reconstructed_residual += 1
         sanity = set_svd_lora(
             module,
@@ -783,7 +810,7 @@ def attach_svd_lora_to_diff_layers(
             sanity_check=(compensation_mode == "residual" and attached == 0),
         )
         if compensation_mode == "residual":
-            print(f"[SVD-LoRA] {residual_source} residual base weight for {name}")
+            print(f"[SVD-LoRA] {residual_source} residual base weight for {name}")  # PORTED: distinguish stored vs runtime-reconstructed residual base.
             if sanity is not None:
                 print(
                     "[SVD-LoRA] residual sanity "
@@ -799,7 +826,7 @@ def attach_svd_lora_to_diff_layers(
     if missing:
         print(f"[SVD-LoRA] warning: skipped {len(missing)} layers without checkpoint factors")
     if reconstructed_residual:
-        print(f"[SVD-LoRA] reconstructed residual base weights for {reconstructed_residual} layers")
+        print(f"[SVD-LoRA] reconstructed residual base weights for {reconstructed_residual} layers")  # PORTED: summarize compact residual checkpoint path.
     if attached == 0:
         print("[SVD-LoRA] warning: no SVD-aware diff layers matched the checkpoint")
     else:
@@ -807,7 +834,7 @@ def attach_svd_lora_to_diff_layers(
     return attached
 
 
-def QuantizeLlamaForLOZOSVD(
+def QuantizeOPTForLOZOSVD(  # PORTED: OPT-specific SVD-aware replacement path; do not carry over LLaMA module names.
     model,
     uv_provider=None,
     z_provider=None,
@@ -817,8 +844,8 @@ def QuantizeLlamaForLOZOSVD(
 ):
     quant_backend = quant_backend_from_format(quant_format)
 
-    def make_linear(full_name, child):
-        cls = diffSVDLinear if quant_backend == "none" else QdiffSVDLinear
+    def make_linear(full_name, child, quantized=True):  # PORTED: decoder linears can be quantized, OPT head/proj stay diffLinear-compatible.
+        cls = QdiffSVDLinear if quantized and quant_backend != "none" else diffSVDLinear
         kwargs = dict(
             layer_name=full_name,
             in_features=child.in_features,
@@ -841,14 +868,20 @@ def QuantizeLlamaForLOZOSVD(
             new_linear.bias = child.bias
         return new_linear
 
-    def replace_llama_module(module, prefix=""):
+    def replace_opt_module(module, prefix=""):  # PORTED: mirror QuantizeOPTForLOZO traversal with OPT names.
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
-            is_embed_tokens = full_name == "model.embed_tokens"
-            in_decoder_layers = full_name.startswith("model.layers")
+            in_decoder_layers = full_name.startswith("model.decoder.layers")
             is_lm_head = full_name == "lm_head"
+            is_proj_inout = full_name in ("model.decoder.project_in", "model.decoder.project_out")
 
-            if is_embed_tokens and isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):
+            if child.__class__.__name__ == "OPTLearnedPositionalEmbedding":  # PORTED: OPT learned positions are patched, not replaced.
+                child.layer_name = full_name
+                child.uv_provider = uv_provider
+                print(f"Patch {full_name} with layer_name/uv_provider for forward_delta")
+                continue
+
+            if isinstance(child, nn.Embedding) and not isinstance(child, diffEmbedding):  # PORTED: OPT token embeddings use diffEmbedding.
                 new_emb = diffEmbedding(
                     num_embeddings=child.num_embeddings,
                     embedding_dim=child.embedding_dim,
@@ -869,55 +902,58 @@ def QuantizeLlamaForLOZOSVD(
 
             if in_decoder_layers and isinstance(child, nn.Linear) and not isinstance(child, (diffSVDLinear, QdiffSVDLinear)):
                 setattr(module, name, make_linear(full_name, child))
-                print(f"Replace decoder linear {full_name} with SVD-aware diff linear")
+                print(f"Replace decoder linear {full_name} with OPT SVD-aware diff linear")
                 continue
 
-            if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffLinear):
+            if is_proj_inout and isinstance(child, nn.Linear) and not isinstance(child, diffSVDLinear):  # PORTED: preserve OPT project_in/out diffLinear structure.
+                setattr(module, name, make_linear(full_name, child, quantized=False))
+                print(f"Replace {full_name} with OPT SVD-aware diff linear")
+                continue
+
+            if is_lm_head and isinstance(child, nn.Linear) and not isinstance(child, diffSVDLinear):
                 provider_layer_name = full_name
                 try:
-                    if hasattr(model, "model") and hasattr(model.model, "embed_tokens") and child.weight is model.model.embed_tokens.weight:
-                        provider_layer_name = "model.embed_tokens"
+                    if hasattr(model, "model") and hasattr(model.model, "decoder") and child.weight is model.model.decoder.embed_tokens.weight:
+                        provider_layer_name = "model.decoder.embed_tokens"  # PORTED: tied OPT lm_head reuses embed_tokens provider key.
                 except Exception:
                     provider_layer_name = full_name
-                new_head = diffLinear(
-                    layer_name=provider_layer_name,
-                    in_features=child.in_features,
-                    out_features=child.out_features,
-                    bias=(child.bias is not None),
-                    device="meta",
-                    dtype=child.weight.dtype,
-                    uv_provider=uv_provider,
-                    z_provider=z_provider,
-                )
-                new_head.weight = child.weight
-                if child.bias is not None:
-                    new_head.bias = child.bias
-                setattr(module, name, new_head)
-                print(f"Replace {full_name} with diffLinear, provider layer_name={provider_layer_name}")
+                setattr(module, name, make_linear(provider_layer_name, child, quantized=False))
+                print(f"Replace {full_name} with SVD-aware diff linear, provider layer_name={provider_layer_name}")
                 continue
 
-            if child.__class__.__name__ == "LlamaRMSNorm":
-                new_norm = diffLlamaRMSNorm(
-                    hidden_size=child.weight.shape[0],
-                    eps=child.variance_epsilon,
+            if isinstance(child, nn.LayerNorm) and not isinstance(child, diffLayerNorm):  # PORTED: OPT uses LayerNorm.
+                new_norm = diffLayerNorm(
+                    normalized_shape=child.normalized_shape,
+                    eps=child.eps,
+                    elementwise_affine=child.elementwise_affine,
                     layer_name=full_name,
                     z_provider=z_provider,
                     device="meta",
-                    dtype=child.weight.dtype,
+                    dtype=child.weight.dtype if child.weight is not None else None,
                 )
-                new_norm.weight = child.weight
+                if child.weight is not None:
+                    new_norm.weight = child.weight
+                if child.bias is not None:
+                    new_norm.bias = child.bias
                 setattr(module, name, new_norm)
-                print(f"Replace {full_name} with diffLlamaRMSNorm")
+                print(f"Replace {full_name} with diffLayerNorm")
                 continue
 
-            replace_llama_module(child, full_name)
+            replace_opt_module(child, full_name)
 
-    if getattr(model, "config", None) is not None and model.config.model_type == "llama":
-        replace_llama_module(model)
+    if getattr(model, "config", None) is not None and model.config.model_type == "opt":
+        replace_opt_module(model)
+        if getattr(model.config, "tie_word_embeddings", False):
+            try:
+                model.tie_weights()
+                if hasattr(model, "lm_head") and isinstance(model.lm_head, diffSVDLinear):
+                    model.lm_head.layer_name = "model.decoder.embed_tokens"  # PORTED: match QuantizeOPTForLOZO tied-head provider key.
+                    model.lm_head.uv_provider = uv_provider
+                    model.lm_head.z_provider = z_provider
+                    print("[PATCH] tied lm_head delta key -> model.decoder.embed_tokens")
+            except Exception as e:
+                print(f"[WARN] model.tie_weights() failed: {e}")
+        print(model)
     else:
-        print("Model is not a Llama model, skip QuantizeLlamaForLOZOSVD.")
-
-
-def QuantizeOPTForLOZOSVD(*args, **kwargs):
-    raise NotImplementedError("SVD-aware LOZO replacement is currently implemented for Llama only.")
+        print("Model is not an OPT model, skip QuantizeOPTForLOZOSVD.")
 

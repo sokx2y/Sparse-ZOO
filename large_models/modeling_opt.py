@@ -1107,9 +1107,13 @@ class OPTDecoder(OPTPreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         if self.final_layer_norm is not None:
+            norm_device = self.final_layer_norm.weight.device  # PORTED: replaced final LayerNorm may miss Accelerate hooks in normal forward.
+            hidden_states = hidden_states.to(norm_device)  # PORTED: align normal-forward activations with final LayerNorm.
             hidden_states = self.final_layer_norm(hidden_states)
 
         if self.project_out is not None:
+            project_out_device = self.project_out.weight.device  # PORTED: project_out may live on another GPU under device_map.
+            hidden_states = hidden_states.to(project_out_device)  # PORTED: align normal-forward activations with project_out.
             hidden_states = self.project_out(hidden_states)
 
         # add hidden states from the last decoder layer
@@ -1216,11 +1220,27 @@ class OPTDecoder(OPTPreTrainedModel):
             past_key_value = past_key_values[idx] if past_key_values is not None else None
     
             # 不做 checkpoint 分支
+            # PORTED: direct forward_delta calls bypass Accelerate device_map hooks, so align layer-local tensors manually.
+            layer_device = next(decoder_layer.parameters()).device  # PORTED: OPT decoder layers can live on different GPUs.
+            hidden_states = hidden_states.to(layer_device)  # PORTED: keep activations on the current decoder layer device.
+            diff_hidden_states = diff_hidden_states.to(layer_device)  # PORTED: keep diff activations on the current decoder layer device.
+            layer_attention_mask = (
+                causal_attention_mask.to(layer_device) if isinstance(causal_attention_mask, torch.Tensor) else causal_attention_mask
+            )  # PORTED: attention mask must follow the current decoder layer.
+            layer_head_mask = head_mask[idx] if head_mask is not None else None  # PORTED: preserve OPT per-layer head mask behavior.
+            layer_head_mask = (
+                layer_head_mask.to(layer_device) if isinstance(layer_head_mask, torch.Tensor) else layer_head_mask
+            )  # PORTED: head mask must follow the current decoder layer.
+            if past_key_value is not None:  # PORTED: cache tensors must follow the current decoder layer under device_map.
+                past_key_value = tuple(
+                    item.to(layer_device) if isinstance(item, torch.Tensor) else item for item in past_key_value
+                )
+
             layer_outputs = decoder_layer.forward_delta(
                 hidden_states,
                 diff_hidden_states,
-                attention_mask=causal_attention_mask,
-                layer_head_mask=(head_mask[idx] if head_mask is not None else None),
+                attention_mask=layer_attention_mask,
+                layer_head_mask=layer_head_mask,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 past_key_value=past_key_value,
@@ -1239,9 +1259,15 @@ class OPTDecoder(OPTPreTrainedModel):
                 next_decoder_cache += (present_key_value,)
     
         if self.final_layer_norm is not None:
+            norm_device = self.final_layer_norm.weight.device  # PORTED: final norm may be placed after the last decoder layer on another GPU.
+            hidden_states = hidden_states.to(norm_device)  # PORTED: align base activations with final LayerNorm.
+            diff_hidden_states = diff_hidden_states.to(norm_device)  # PORTED: align diff activations with final LayerNorm.
             hidden_states, diff_hidden_states = self.final_layer_norm.forward_delta(hidden_states, diff_hidden_states)
     
         if self.project_out is not None:
+            project_out_device = self.project_out.weight.device  # PORTED: OPT project_out may live on a different device from final norm.
+            hidden_states = hidden_states.to(project_out_device)  # PORTED: align base activations with project_out.
+            diff_hidden_states = diff_hidden_states.to(project_out_device)  # PORTED: align diff activations with project_out.
             hidden_states, diff_hidden_states = self.project_out.forward_delta(hidden_states, diff_hidden_states)
     
         # add hidden states from the last decoder layer
@@ -1397,6 +1423,10 @@ class OPTModel(OPTPreTrainedModel):
         )
 
 def _loss_like_wrapper(self, shift_logits, input_ids, labels, option_len=None, num_options=None):
+    logit_device = shift_logits.device  # PORTED: forward_delta lm_head can be on another GPU under device_map.
+    input_ids = input_ids.to(logit_device)  # PORTED: align token labels used for causal loss indexing.
+    if labels is not None:  # PORTED: align classification labels with logits for option losses.
+        labels = labels.to(logit_device)
     # shift_labels 用 input_ids（对齐 forward_wrap_with_option_len）
     shift_labels = torch.clone(input_ids)[..., 1:].contiguous()
 
@@ -1583,13 +1613,16 @@ class OPTForCausalLM(OPTPreTrainedModel):
             return_dict=return_dict,
         )
 
-        logits = self.lm_head(outputs[0]).contiguous()
+        hidden_states = outputs[0]
+        head_device = self.lm_head.weight.device  # PORTED: replaced lm_head may miss Accelerate hooks in normal forward.
+        hidden_states = hidden_states.to(head_device)  # PORTED: align normal-forward activations with lm_head.
+        logits = self.lm_head(hidden_states).contiguous()
 
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_labels = labels.to(logits.device)[..., 1:].contiguous()  # PORTED: labels must follow sharded lm_head logits.
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
@@ -1650,6 +1683,9 @@ class OPTForCausalLM(OPTPreTrainedModel):
             hidden_states = dec_out[0]
             diff_hidden_states = dec_out[1]
     
+        head_device = self.lm_head.weight.device  # PORTED: lm_head can be on another GPU and SVD replacement can miss Accelerate hooks.
+        hidden_states = hidden_states.to(head_device)  # PORTED: align base activations with lm_head.
+        diff_hidden_states = diff_hidden_states.to(head_device)  # PORTED: align diff activations with lm_head.
         logits, diff_logits = self.lm_head.forward_delta(hidden_states, diff_hidden_states)
         logits = logits.contiguous()
         diff_logits = diff_logits.contiguous()
@@ -1986,3 +2022,4 @@ class OPTForQuestionAnswering(OPTPreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.model.decoder.embed_tokens = value
+

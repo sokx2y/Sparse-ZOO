@@ -45,6 +45,11 @@ def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=N
     if labels is None:
         return outputs
     logits = outputs.logits
+    logit_device = logits.device  # PORTED: align labels/input_ids with sharded logits device before loss indexing.
+    if input_ids is not None and isinstance(input_ids, torch.Tensor):  # PORTED: avoid multi-GPU device mismatch in option loss.
+        input_ids = input_ids.to(logit_device)
+    if labels is not None and isinstance(labels, torch.Tensor):  # PORTED: avoid multi-GPU device mismatch in option loss.
+        labels = labels.to(logit_device)
 
     loss = None
     # Shift so that tokens < n predict n
@@ -164,10 +169,24 @@ def encode_prompt(task, template, train_samples, eval_sample, tokenizer, max_len
 
     if any([len(encoding) > max_length for encoding in encodings]):
         logger.warn("Exceed max length")
-    if tokenizer.add_bos_token:
-        encodings = [encoding[0:1] + encoding[1:][-(max_length-1):] for encoding in encodings]  
+    
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)  # PORTED: tokenizer.add_bos_token is absent on some OPT tokenizers.
+    try:  # PORTED: infer whether special-token encoding actually prepends BOS.
+        test_with = tokenizer.encode("hello", add_special_tokens=True)
+        test_without = tokenizer.encode("hello", add_special_tokens=False)
+        add_bos_token = (
+            bos_token_id is not None
+            and len(test_with) > len(test_without)
+            and len(test_with) > 0
+            and test_with[0] == bos_token_id
+        )
+    except TypeError:
+        add_bos_token = False
+
+    if add_bos_token:
+        encodings = [encoding[0:1] + encoding[1:][-(max_length-1):] for encoding in encodings]
     else:
-        encodings = [encoding[-max_length:] for encoding in encodings]  
+        encodings = [encoding[-max_length:] for encoding in encodings]
    
     return encodings, option_lens
  

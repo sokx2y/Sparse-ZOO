@@ -27,6 +27,7 @@ from LOZOtrainer import LowRankTrainer
 from LOZOtrainer0 import LowRankTrainer as OrdinaryLowRankTrainer
 import random
 from diff_fake_quant_mx import QuantizeOPTForLOZO, QuantizeLlamaForLOZO
+from nv_quant_linear import replace_llama_linears_with_nv, replace_opt_linears_with_nv
 from modeling_opt import OPTForCausalLM
 from modeling_llama import LlamaForCausalLM
 
@@ -84,6 +85,10 @@ class OurArguments(TrainingArguments):
     debug_loss_steps: int = field(
         default=5,
         metadata={"help": "Number of early LOZO steps to print when debug_loss is enabled."}
+    )
+    debug_loss_interval: int = field(
+        default=0,
+        metadata={"help": "When debug_loss is enabled, print rolling LOZO projected-gradient stats every N steps. 0 disables periodic stats."}
     )
     
     # LOZO
@@ -183,6 +188,11 @@ class OurArguments(TrainingArguments):
     enable_diffw: bool = field(
         default=False,
         metadata={"help": "quantize diff_weight"}
+    )
+
+    nv_quant_mode: str = field(
+        default="none",
+        metadata={"help": "Original LoZO Linear quantization: none | w4a8 | w8a8"},
     )
 
     # Linear outlier profiling
@@ -484,6 +494,18 @@ class Framework:
             max_memory[i] = f"{max(1, allowed)}GiB"
         return max_memory
 
+    def _model_source(self):
+        if self.args.model_path:
+            model_path = Path(self.args.model_path).expanduser()
+            if model_path.exists():
+                return str(model_path)
+            logger.warning(
+                "[MODEL_LOAD] model_path does not exist: %s; falling back to HuggingFace model_name=%s",
+                self.args.model_path,
+                self.args.model_name,
+            )
+        return self.args.model_name
+
 
     def load_model(self):
         """
@@ -491,7 +513,9 @@ class Framework:
         """
         with count_time("Loading model with FP%d" % (16 if self.args.load_float16 or self.args.load_bfloat16 else 32)):
             free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
-            config = AutoConfig.from_pretrained(self.args.model_name if self.args.model_path is None else self.args.model_path)
+            model_source = self._model_source()
+            logger.info("[MODEL_LOAD] source = %s", model_source)
+            config = AutoConfig.from_pretrained(model_source)
             is_llama = "llama" in self.args.model_name.lower() or getattr(config, "model_type", None) == "llama"
             if is_llama and hasattr(config, "use_cache"):
                 config.use_cache = False
@@ -503,19 +527,19 @@ class Framework:
                 # Head tuning
                 from ht_opt import OPTForCausalLM as HT_OPTForCausalLM
                 model = HT_OPTForCausalLM.from_pretrained(
-                    self.args.model_name if self.args.model_path is None else self.args.model_path,
+                    model_source,
                     config=config,
                 )
             elif self.args.no_auto_device:
                 # No auto device (use for FSDP)
                 if is_llama:
                     model = LlamaForCausalLM.from_pretrained(
-                        self.args.model_name if self.args.model_path is None else self.args.model_path,
+                        model_source,
                         config=config,
                     )
                 else:
                     model = OPTForCausalLM.from_pretrained(
-                        self.args.model_name if self.args.model_path is None else self.args.model_path,
+                        model_source,
                         config=config,
                     )
             else:
@@ -530,7 +554,7 @@ class Framework:
                 logger.info(f"[DEVICE_MAP] visible cuda devices = {torch.cuda.device_count()}")
                 if is_llama:
                     model = LlamaForCausalLM.from_pretrained(
-                        self.args.model_name if self.args.model_path is None else self.args.model_path,
+                        model_source,
                         config=config,
                         device_map='auto',
                         torch_dtype=torch_dtype,
@@ -539,7 +563,7 @@ class Framework:
                     )
                 else:
                     model = OPTForCausalLM.from_pretrained(
-                        self.args.model_name if self.args.model_path is None else self.args.model_path,
+                        model_source,
                         config=config,
                         device_map='auto',
                         torch_dtype=torch_dtype,
@@ -559,7 +583,7 @@ class Framework:
             print(model)
 
         # Load tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.args.model_name if self.args.model_path is None else self.args.model_path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=False)
 
         # HF tokenizer bug fix
         if "opt" in self.args.model_name:
@@ -908,6 +932,33 @@ class Framework:
             collator = NondiffCollator
         else:
             collator = DataCollatorForTokenClassification
+
+        nv_quant_mode = self.args.nv_quant_mode.lower()
+        if nv_quant_mode not in {"none", "w4a8", "w8a8"}:
+            raise ValueError(
+                f"Unsupported --nv_quant_mode={self.args.nv_quant_mode}; "
+                "expected none, w4a8, or w8a8"
+            )
+        if nv_quant_mode != "none":
+            if self.args.apply_forward_delta:
+                raise ValueError("--nv_quant_mode requires --apply_forward_delta False")
+            if self.args.trainer != "LOZO":
+                raise ValueError("--nv_quant_mode is only supported by the original LOZO trainer")
+            model_type = self.model.config.model_type
+            if model_type == "opt":
+                replaced = replace_opt_linears_with_nv(self.model, nv_quant_mode)
+            elif model_type == "llama":
+                replaced = replace_llama_linears_with_nv(self.model, nv_quant_mode)
+            else:
+                raise ValueError(
+                    f"--nv_quant_mode does not support model_type={model_type}"
+                )
+            logger.info(
+                "Replaced %d %s decoder Linear modules for NV %s quantization",
+                replaced,
+                model_type,
+                nv_quant_mode.upper(),
+            )
 
         if self.args.trainer == "LOZO":
             print("tariner is LOZO")

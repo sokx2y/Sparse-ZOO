@@ -344,11 +344,20 @@ class LowRankTrainer(LinearHeadTrainer):
         provide z to replace diff_bias and diff_weight in layernorm
         """
         def provider(param_name, shape, device, dtype, inference_count):
-            z = None
-            if hasattr(self, "z"):
-                z = self.z.get(param_name, None)
-            if z is None:
-                z = torch.normal(mean=0.0, std=1.0, size=shape, device=device, dtype=dtype)
+            if not hasattr(self, "z") or param_name not in self.z:
+                if (
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return torch.zeros(shape, device=device, dtype=dtype), 0.0
+                keys = list(self.z.keys())[:20] if hasattr(self, "z") else []
+                raise RuntimeError(
+                    f"[FD_PROVIDER_MISS][z] param_name={param_name}, "
+                    f"shape={shape}, inference_count={inference_count}. "
+                    f"First cached z keys={keys}"
+                )
+            z = self.z[param_name]
             scale = -2 * self.args.zo_eps
             return z, scale
         
@@ -364,8 +373,23 @@ class LowRankTrainer(LinearHeadTrainer):
             v = None
             if hasattr(self, "v"):
                 v = self.v.get(param_name, None)
-            if v is None: 
-                v = torch.randn(in_f, self.args.rank, device=device, dtype=dtype)
+            if v is None:
+                if (
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return (
+                        torch.zeros(out_f, 1, device=device, dtype=dtype),
+                        torch.zeros(in_f, 1, device=device, dtype=dtype),
+                        0.0,
+                    )
+                keys = list(self.v.keys())[:20] if hasattr(self, "v") else []
+                raise RuntimeError(
+                    f"[FD_PROVIDER_MISS][v] param_name={param_name}, "
+                    f"shape={shape}, inference_count={inference_count}. "
+                    f"First cached v keys={keys}"
+                )
                 
             # But failed: provide u from regeneration(cache seed_u)
             # if param_name in self.u_seeds:
@@ -378,8 +402,23 @@ class LowRankTrainer(LinearHeadTrainer):
             u = None
             if hasattr(self, "u"):
                 u = self.u.get(param_name, None)
-            if u is None: 
-                u = torch.randn(out_f, self.args.rank, device=device, dtype=dtype)
+            if u is None:
+                if (
+                    hasattr(self, "all_parameter_names")
+                    and param_name in self.all_parameter_names
+                    and param_name not in getattr(self, "trainable_parameter_names", set())
+                ):
+                    return (
+                        torch.zeros(out_f, 1, device=device, dtype=dtype),
+                        torch.zeros(in_f, 1, device=device, dtype=dtype),
+                        0.0,
+                    )
+                keys = list(self.u.keys())[:20] if hasattr(self, "u") else []
+                raise RuntimeError(
+                    f"[FD_PROVIDER_MISS][u] param_name={param_name}, "
+                    f"shape={shape}, inference_count={inference_count}. "
+                    f"First cached u keys={keys}"
+                )
             
             # The difference between the even iteration and the odd cached weights is −2×zo_eps×(UVT).
             scale = -2 * self.args.zo_eps
@@ -463,9 +502,13 @@ class LowRankTrainer(LinearHeadTrainer):
             self.exp_avg_sq = {}
 
         self.named_parameters_to_optim = []
+        self.all_parameter_names = set()
+        self.trainable_parameter_names = set()
         for name, param in model.named_parameters():
+            self.all_parameter_names.add(name)
             if param.requires_grad:
                 self.named_parameters_to_optim.append((name, param))
+                self.trainable_parameter_names.add(name)
 
         # Sample the random seed for sampling z
         self.zo_random_seed = np.random.randint(1000000000)

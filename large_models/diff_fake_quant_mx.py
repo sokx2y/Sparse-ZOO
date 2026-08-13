@@ -282,12 +282,19 @@ class diffLayerNorm(nn.LayerNorm):
         self.inference_count = 0
         
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return super().forward(input)   
+        return self._forward_compatible(input, self.weight, self.bias)  # PORTED: old torch requires LayerNorm input/weight dtype alignment.
+    
+    def _forward_compatible(self, input: torch.Tensor, weight, bias):  # PORTED: support fp16 activations with fp32 LayerNorm weights.
+        input_dtype = input.dtype  # PORTED: keep downstream OPT linears seeing the original activation dtype.
+        if weight is not None and input.dtype != weight.dtype:
+            input = input.to(weight.dtype)  # PORTED: compute LayerNorm in parameter dtype for old torch compatibility.
+        output = F.layer_norm(input, self.normalized_shape, weight, bias, self.eps)  # PORTED: avoid nn.LayerNorm mixed dtype RuntimeError.
+        return output.to(input_dtype) if output.dtype != input_dtype else output  # PORTED: restore activation dtype after LayerNorm.
     
     def forward_delta(self, input: torch.Tensor, diff_input: torch.Tensor):
         self.inference_count += 1
         # ground state output
-        output = super().forward(input)
+        output = self._forward_compatible(input, self.weight, self.bias)  # PORTED: old torch requires LayerNorm input/weight dtype alignment.
         
         input_1 = input + diff_input
         if self.elementwise_affine:
@@ -321,7 +328,7 @@ class diffLayerNorm(nn.LayerNorm):
                 )
                 bias_1 = bias + z_b * scale_b      # β_new = β + Δβ
                 # print(f"step:{self.inference_count}: name:{self.layer_name}, fake_z_b[0]:{z_b[0]}")
-        output_1 = F.layer_norm(input_1, self.normalized_shape, weight_1, bias_1, self.eps)
+        output_1 = self._forward_compatible(input_1, weight_1, bias_1)  # PORTED: keep perturbed LayerNorm dtype-compatible too.
         diff_output = output_1 - output
         
         return output, diff_output

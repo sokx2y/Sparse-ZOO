@@ -688,16 +688,19 @@ class LowRankTrainer(Trainer):
                             tr_loss_step = self.training_step(model, inputs)
                     else:
                         tr_loss_step = self.training_step(model, inputs)
-
+                        
+                tr_loss_step_for_accum = tr_loss_step.to(device=tr_loss.device)
                 if (
                     args.logging_nan_inf_filter
                     and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    # and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    and (torch.isnan(tr_loss_step_for_accum) or torch.isinf(tr_loss_step_for_accum))
                 ):
                     # if loss is nan or inf simply add the average of previous logged losses
                     tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
                 else:
-                    tr_loss += tr_loss_step
+                    # tr_loss += tr_loss_step
+                    tr_loss += tr_loss_step_for_accum
 
                 self.current_flos += float(self.floating_point_ops(inputs))
 
@@ -1349,19 +1352,72 @@ class LowRankTrainer(Trainer):
         # loss2 = self.zo_forward(model, inputs)
 
         self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
-        if getattr(args, "debug_loss", False) and self.step < int(getattr(args, "debug_loss_steps", 5)):
+        if getattr(args, "debug_loss", False):
             loss1_f = float(loss1.detach().cpu())
             loss2_f = float(loss2.detach().cpu())
-            print(
-                "[ZO-LOSS-DEBUG]",
-                f"step={self.step}",
-                f"loss1={loss1_f:.12e}",
-                f"loss2={loss2_f:.12e}",
-                f"diff={(loss1_f - loss2_f):.12e}",
-                f"eps={self.args.zo_eps:.6e}",
-                f"projected_grad={self.projected_grad:.12e}",
-                flush=True,
-            )
+            loss_diff_f = loss1_f - loss2_f
+            projected_grad_f = float(self.projected_grad)
+            if self.step < int(getattr(args, "debug_loss_steps", 5)):
+                print(
+                    "[ZO-LOSS-DEBUG]",
+                    f"step={self.step}",
+                    f"loss1={loss1_f:.12e}",
+                    f"loss2={loss2_f:.12e}",
+                    f"diff={loss_diff_f:.12e}",
+                    f"eps={self.args.zo_eps:.6e}",
+                    f"projected_grad={projected_grad_f:.12e}",
+                    flush=True,
+                )
+            interval = int(getattr(args, "debug_loss_interval", 0) or 0)
+            if interval > 0:
+                stats = getattr(self, "_zo_loss_debug_stats", None)
+                if stats is None:
+                    stats = {
+                        "start_step": self.step,
+                        "n": 0,
+                        "finite_n": 0,
+                        "nonfinite_n": 0,
+                        "sum_abs_diff": 0.0,
+                        "max_abs_diff": 0.0,
+                        "sum_abs_pg": 0.0,
+                        "max_abs_pg": 0.0,
+                        "sign_flips": 0,
+                        "last_sign": 0,
+                    }
+                    self._zo_loss_debug_stats = stats
+                abs_diff = abs(loss_diff_f)
+                stats["n"] += 1
+                stats["sum_abs_diff"] += abs_diff
+                stats["max_abs_diff"] = max(stats["max_abs_diff"], abs_diff)
+                if np.isfinite(projected_grad_f):
+                    abs_pg = abs(projected_grad_f)
+                    sign = 1 if projected_grad_f > 0 else (-1 if projected_grad_f < 0 else 0)
+                    stats["finite_n"] += 1
+                    stats["sum_abs_pg"] += abs_pg
+                    stats["max_abs_pg"] = max(stats["max_abs_pg"], abs_pg)
+                    if stats["last_sign"] and sign and sign != stats["last_sign"]:
+                        stats["sign_flips"] += 1
+                    if sign:
+                        stats["last_sign"] = sign
+                else:
+                    stats["nonfinite_n"] += 1
+                if (self.step + 1) % interval == 0:
+                    n = max(int(stats["n"]), 1)
+                    finite_n = max(int(stats["finite_n"]), 1)
+                    flip_den = max(int(stats["finite_n"]) - 1, 1)
+                    print(
+                        "[ZO-LOSS-STATS]",
+                        f"steps={stats['start_step']}-{self.step}",
+                        f"n={stats['n']}",
+                        f"abs_diff_mean={stats['sum_abs_diff'] / n:.12e}",
+                        f"abs_diff_max={stats['max_abs_diff']:.12e}",
+                        f"pg_abs_mean={stats['sum_abs_pg'] / finite_n:.12e}",
+                        f"pg_abs_max={stats['max_abs_pg']:.12e}",
+                        f"pg_sign_flip_ratio={stats['sign_flips'] / flip_den:.6f}",
+                        f"nonfinite={stats['nonfinite_n']}",
+                        flush=True,
+                    )
+                    self._zo_loss_debug_stats = None
         if not np.isfinite(self.projected_grad):
             print(
                 "[ZO-NONFINITE-GRAD]",

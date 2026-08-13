@@ -13,6 +13,31 @@ from single_linear_sim import (
 DEFAULT_OUTPUT_PRECISION_BITS = 16
 DEFAULT_BASE_ACTIVATION_PRECISION_BITS = 8
 DEFAULT_BASE_WEIGHT_PRECISION_BITS = 8
+DEFAULT_DRAM_EFFECTIVE_BW_BITS_PER_CYCLE = 256.0
+DEFAULT_DRAM_ENERGY_PJ_PER_BIT = 18.75
+
+DRAM_PROFILE_DATA_RATE_MTPS = {
+    "ddr4-3200": 3200.0,
+    "ddr5-4800": 4800.0,
+    "ddr5-5600": 5600.0,
+    "ddr5-6400": 6400.0,
+}
+
+
+def resolve_dram_effective_bw_bits_per_cycle(
+    profile: str,
+    data_rate_mtps: Optional[float],
+    bus_width_bits: float,
+    channels: int,
+    accelerator_freq_mhz: float,
+) -> float:
+    if data_rate_mtps is None and profile == "legacy":
+        return DEFAULT_DRAM_EFFECTIVE_BW_BITS_PER_CYCLE
+    if data_rate_mtps is None:
+        data_rate_mtps = DRAM_PROFILE_DATA_RATE_MTPS[profile]
+    if data_rate_mtps <= 0 or bus_width_bits <= 0 or channels <= 0 or accelerator_freq_mhz <= 0:
+        raise ValueError("DRAM data rate, bus width, channels, and accelerator frequency must be > 0")
+    return float(data_rate_mtps) * float(bus_width_bits) * int(channels) / float(accelerator_freq_mhz)
 
 
 def get_default_bitmodbb_config(
@@ -75,6 +100,8 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
         layer_name: str = "single_linear",
         base_activation_prec: float = DEFAULT_BASE_ACTIVATION_PRECISION_BITS,
         base_weight_prec: float = DEFAULT_BASE_WEIGHT_PRECISION_BITS,
+        dram_effective_bw_bits_per_cycle: float = DEFAULT_DRAM_EFFECTIVE_BW_BITS_PER_CYCLE,
+        dram_energy_pj_per_bit: float = DEFAULT_DRAM_ENERGY_PJ_PER_BIT,
     ):
         self.output_prec = self._validate_positive_precision(output_prec, "output_prec")
         self.base_activation_prec = self._validate_positive_precision(
@@ -84,6 +111,12 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
             base_weight_prec, "base_weight_prec"
         )
         self._layer_effective_parallelism = {}
+        self.dram_effective_bw_bits_per_cycle = self._validate_positive_precision(
+            dram_effective_bw_bits_per_cycle, "dram_effective_bw_bits_per_cycle"
+        )
+        self.dram_energy_pj_per_bit = self._validate_positive_precision(
+            dram_energy_pj_per_bit, "dram_energy_pj_per_bit"
+        )
 
         super().__init__(
             x=x,
@@ -108,6 +141,15 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
         if init_mem:
             _ensure_supported_runtime()
             self._init_mem()
+            # Accelerator models DDR as rw_bw * 2. Store half the requested
+            # effective bandwidth while preserving an explicit pJ/bit cost.
+            self.dram.rw_bw = self.dram_effective_bw_bits_per_cycle / 2.0
+            self.dram.r_cost = self.dram.rw_bw * self.dram_energy_pj_per_bit
+            self.dram.w_cost = self.dram.rw_bw * self.dram_energy_pj_per_bit
+            self.dram.r_bw_min = self.dram.rw_bw
+            self.dram.w_bw_min = self.dram.rw_bw
+            self.dram.r_cost_min = self.dram.r_cost
+            self.dram.w_cost_min = self.dram.w_cost
             self._check_layer_mem_size()
             self._calc_num_mem_refetch()
             self.mem_initialized = True
@@ -323,6 +365,10 @@ class SingleLinearSimulatorBB(SingleLinearSimulator):
                 layer_name, self.get_effective_parallelism(layer_name)
             ),
         }
+        result["dram_model"] = {
+            "effective_bandwidth_bits_per_cycle": self.dram_effective_bw_bits_per_cycle,
+            "energy_pj_per_bit": self.dram_energy_pj_per_bit,
+        }
         return result
 
 
@@ -408,6 +454,27 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a minimal trend check without initializing CACTI memories.",
     )
+    parser.add_argument(
+        "--dram_profile",
+        choices=("legacy", *DRAM_PROFILE_DATA_RATE_MTPS.keys()),
+        default="legacy",
+        help="DRAM bandwidth profile. legacy preserves the original 256 effective bits/cycle.",
+    )
+    parser.add_argument(
+        "--dram_data_rate_mtps",
+        type=float,
+        default=None,
+        help="Custom DRAM data rate in MT/s. Overrides --dram_profile when provided.",
+    )
+    parser.add_argument("--dram_bus_width_bits", type=float, default=64.0)
+    parser.add_argument("--dram_channels", type=int, default=1)
+    parser.add_argument("--accelerator_freq_mhz", type=float, default=1000.0)
+    parser.add_argument(
+        "--dram_energy_pj_per_bit",
+        type=float,
+        default=DEFAULT_DRAM_ENERGY_PJ_PER_BIT,
+        help="DRAM transfer energy. Defaults to the legacy model's 18.75 pJ/bit.",
+    )
     return parser
 
 
@@ -480,6 +547,9 @@ def _print_summary(result: Dict[str, Any]) -> None:
     compute_model = result.get("compute_model", {})
     if compute_model:
         print(f"compute model:     {compute_model}")
+    dram_model = result.get("dram_model", {})
+    if dram_model:
+        print(f"dram model:        {dram_model}")
 
 
 def run_minimal_sanity_check() -> Dict[str, Dict[str, Any]]:
@@ -567,5 +637,13 @@ if __name__ == "__main__":
             is_generation=bitmod_cfg["IS_GENERATION"],
             base_activation_prec=args.base_activation_prec,
             base_weight_prec=args.base_weight_prec,
+            dram_effective_bw_bits_per_cycle=resolve_dram_effective_bw_bits_per_cycle(
+                args.dram_profile,
+                args.dram_data_rate_mtps,
+                args.dram_bus_width_bits,
+                args.dram_channels,
+                args.accelerator_freq_mhz,
+            ),
+            dram_energy_pj_per_bit=args.dram_energy_pj_per_bit,
         )
         _print_summary(sim.simulate())
